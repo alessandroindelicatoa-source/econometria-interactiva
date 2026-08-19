@@ -6,7 +6,10 @@ import re
 import smtplib
 import ssl
 import uuid
-from datetime import datetime
+import json
+import tempfile
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -451,6 +454,318 @@ def reset_quiz_state():
 
 
 
+
+# ============================================================
+# CONTROL DEL MODO EXAMEN
+# ============================================================
+
+MADRID_TZ = ZoneInfo("Europe/Madrid")
+TEST_CONTROL_FILE = Path(tempfile.gettempdir()) / "econometria_test_control.json"
+
+
+def default_test_control():
+    return {
+        "enabled": False,
+        "start": None,
+        "end": None,
+        "updated_at": None,
+    }
+
+
+def load_test_control():
+    """
+    Estado compartido entre las sesiones de la app mientras el contenedor
+    de Streamlit siga activo.
+    """
+    if not TEST_CONTROL_FILE.exists():
+        return default_test_control()
+
+    try:
+        data = json.loads(
+            TEST_CONTROL_FILE.read_text(encoding="utf-8")
+        )
+    except Exception:
+        return default_test_control()
+
+    base = default_test_control()
+    base.update(data if isinstance(data, dict) else {})
+    return base
+
+
+def save_test_control(control):
+    TEST_CONTROL_FILE.write_text(
+        json.dumps(control, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def parse_control_datetime(value):
+    if not value:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=MADRID_TZ)
+        return dt.astimezone(MADRID_TZ)
+    except Exception:
+        return None
+
+
+def get_test_gate_status():
+    """
+    Devuelve:
+      status: 'disabled', 'scheduled', 'open' o 'closed'
+      control: configuración
+      now: hora actual de Madrid
+      start/end: datetimes
+    """
+    control = load_test_control()
+    now = datetime.now(MADRID_TZ)
+    start = parse_control_datetime(control.get("start"))
+    end = parse_control_datetime(control.get("end"))
+
+    if not control.get("enabled", False):
+        status = "disabled"
+    elif start is None or end is None:
+        status = "disabled"
+    elif now < start:
+        status = "scheduled"
+    elif start <= now <= end:
+        status = "open"
+    else:
+        status = "closed"
+
+    return status, control, now, start, end
+
+
+def format_madrid_datetime(value):
+    if value is None:
+        return "—"
+    return value.strftime("%d/%m/%Y · %H:%M")
+
+
+def professor_panel():
+    st.sidebar.divider()
+
+    with st.sidebar.expander("🔐 Profesor"):
+        st.caption(
+            "Control de apertura del Mini-test. "
+            "Zona horaria: Europe/Madrid."
+        )
+
+        try:
+            configured_password = str(
+                st.secrets["admin"]["password"]
+            )
+        except Exception:
+            configured_password = ""
+
+        if not configured_password:
+            st.warning(
+                "Falta configurar `[admin] password` "
+                "en los Secrets de Streamlit."
+            )
+            return
+
+        entered = st.text_input(
+            "Contraseña",
+            type="password",
+            key="professor_password",
+        )
+
+        if entered != configured_password:
+            if entered:
+                st.error("Contraseña incorrecta.")
+            return
+
+        st.success("Acceso de profesor")
+
+        status, control, now, start, end = get_test_gate_status()
+
+        status_label = {
+            "disabled": "🔴 Desactivado",
+            "scheduled": "🟠 Programado",
+            "open": "🟢 Abierto",
+            "closed": "⚫ Finalizado",
+        }[status]
+
+        st.markdown(f"**Estado:** {status_label}")
+        st.caption(
+            f"Ahora en Madrid: {format_madrid_datetime(now)}"
+        )
+
+        default_start = start or now.replace(
+            second=0,
+            microsecond=0,
+        )
+        default_end = end or (
+            now.replace(second=0, microsecond=0)
+            + pd.Timedelta(minutes=60)
+        ).to_pydatetime()
+
+        start_date = st.date_input(
+            "Fecha de apertura",
+            value=default_start.date(),
+            key="exam_start_date",
+        )
+
+        start_time = st.time_input(
+            "Hora de apertura",
+            value=default_start.time().replace(
+                second=0,
+                microsecond=0,
+            ),
+            step=60,
+            key="exam_start_time",
+        )
+
+        end_date = st.date_input(
+            "Fecha de cierre",
+            value=default_end.date(),
+            key="exam_end_date",
+        )
+
+        end_time = st.time_input(
+            "Hora de cierre",
+            value=default_end.time().replace(
+                second=0,
+                microsecond=0,
+            ),
+            step=60,
+            key="exam_end_time",
+        )
+
+        if st.button(
+            "💾 Programar y activar",
+            type="primary",
+            use_container_width=True,
+        ):
+            start_dt = datetime.combine(
+                start_date,
+                start_time,
+                tzinfo=MADRID_TZ,
+            )
+            end_dt = datetime.combine(
+                end_date,
+                end_time,
+                tzinfo=MADRID_TZ,
+            )
+
+            if end_dt <= start_dt:
+                st.error(
+                    "La hora de cierre debe ser posterior "
+                    "a la de apertura."
+                )
+            else:
+                save_test_control({
+                    "enabled": True,
+                    "start": start_dt.isoformat(),
+                    "end": end_dt.isoformat(),
+                    "updated_at": datetime.now(
+                        MADRID_TZ
+                    ).isoformat(),
+                })
+                st.success("Mini-test programado.")
+                st.rerun()
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            if st.button(
+                "🟢 Abrir ahora",
+                use_container_width=True,
+            ):
+                end_dt = end or (
+                    now + pd.Timedelta(minutes=60)
+                ).to_pydatetime()
+
+                if end_dt <= now:
+                    end_dt = (
+                        now + pd.Timedelta(minutes=60)
+                    ).to_pydatetime()
+
+                save_test_control({
+                    "enabled": True,
+                    "start": now.isoformat(),
+                    "end": end_dt.isoformat(),
+                    "updated_at": now.isoformat(),
+                })
+                st.rerun()
+
+        with c2:
+            if st.button(
+                "🔴 Cerrar ahora",
+                use_container_width=True,
+            ):
+                save_test_control({
+                    "enabled": False,
+                    "start": control.get("start"),
+                    "end": control.get("end"),
+                    "updated_at": now.isoformat(),
+                })
+                st.rerun()
+
+        if start and end:
+            st.caption(
+                "Apertura: "
+                f"{format_madrid_datetime(start)}\n\n"
+                "Cierre: "
+                f"{format_madrid_datetime(end)}"
+            )
+
+        st.warning(
+            "La programación se conserva mientras la instancia "
+            "de Streamlit permanezca activa. Si la app se reinicia "
+            "completamente, vuelve a programar el examen."
+        )
+
+
+def enforce_test_gate_for_students():
+    """
+    Bloquea el Mini-test antes de cargar el banco o mostrar preguntas.
+    """
+    status, control, now, start, end = get_test_gate_status()
+
+    if status == "open":
+        st.success(
+            "🟢 Mini-test abierto. "
+            f"Cierra a las {format_madrid_datetime(end)}."
+        )
+        return True
+
+    if status == "scheduled":
+        st.info(
+            "🔒 El Mini-test todavía no está abierto."
+        )
+        st.markdown(
+            f"**Apertura:** {format_madrid_datetime(start)}  \n"
+            f"**Cierre:** {format_madrid_datetime(end)}"
+        )
+        st.caption(
+            f"Hora actual: {format_madrid_datetime(now)}"
+        )
+        return False
+
+    if status == "closed":
+        st.warning(
+            "🔒 El plazo del Mini-test ha finalizado."
+        )
+        if end:
+            st.caption(
+                f"El test cerró el {format_madrid_datetime(end)}."
+            )
+        return False
+
+    st.info(
+        "🔒 El Mini-test no está disponible en este momento."
+    )
+    st.caption(
+        "El profesor activará la prueba cuando corresponda."
+    )
+    return False
+
+
 # ============================================================
 # NAVEGACIÓN
 # ============================================================
@@ -477,6 +792,8 @@ st.sidebar.caption(
     "Material complementario de clase · "
     "Prof. Alessandro Indelicato"
 )
+
+professor_panel()
 
 
 # ============================================================
@@ -1335,6 +1652,10 @@ elif section == "✅ Mini-test":
         "Selecciona el temario y realiza una prueba aleatoria de hasta 10 preguntas. "
         "La prueba se envía al profesor; no se muestra la calificación ni las soluciones."
     )
+
+    # El banco y las preguntas solo se cargan cuando el examen está abierto.
+    if not enforce_test_gate_for_students():
+        st.stop()
 
     try:
         bank = load_question_bank()
