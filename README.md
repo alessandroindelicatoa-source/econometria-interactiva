@@ -1,11 +1,11 @@
 # Econometría Interactiva · UVigo
 
-## Archivos de la raíz del repositorio
+## Estructura que debes subir a la raíz del repositorio
 
 ```text
 app.py
 requirements.txt
-MooVi_Econometria_Ficha00_Ficha06_1750.xml
+Banco_preguntas_MooVi_Econometria.xlsx
 README.md
 .gitignore
 .streamlit/
@@ -14,34 +14,36 @@ README.md
 
 ## Mini-test
 
-- El alumno selecciona una o varias fichas del temario.
-- Puede afinar por temas concretos.
+- Banco real: 1.750 preguntas, 250 por Ficha00–Ficha06.
+- El alumno introduce nombre, correo UVigo y grupo.
+- Puede seleccionar una o varias fichas del temario.
+- Puede restringir además a temas concretos.
 - Se generan entre 1 y 10 preguntas aleatorias.
-- Las opciones también se barajan.
-- La selección queda congelada durante el intento.
-- El alumno no ve nota, porcentaje, soluciones ni feedback de corrección.
-- Al enviar, se genera un CSV con identificación, preguntas, respuestas y corrección.
-- El CSV se envía automáticamente a `alessandro.indelicato.a@gmail.com`.
+- Las opciones A–D también se barajan.
+- El intento queda congelado durante la prueba.
+- El alumno no ve nota, porcentaje, respuestas correctas ni explicación.
+- Al enviar, se genera un CSV con la corrección completa para el profesor.
+- El correo de destino es `alessandro.indelicato.a@gmail.com`.
 
 ## Banco de preguntas
 
-Sube a la raíz del repositorio el XML conjunto:
+La aplicación lee directamente:
 
-`MooVi_Econometria_Ficha00_Ficha06_1750.xml`
+`Banco_preguntas_MooVi_Econometria.xlsx`
 
-La app lo lee directamente y utiliza sus Ficha00–Ficha06, temas, dificultad,
-opciones y respuesta correcta.
+y concretamente la hoja **Todas**, con estas columnas:
 
-## Configurar el envío por correo
+`ID`, `Ficha`, `Tema`, `Pregunta`, `Opción A`, `Opción B`,
+`Opción C`, `Opción D`, `Correcta`, `Respuesta correcta`, `Explicación`.
 
-NO escribas la contraseña en `app.py` y NO subas `.streamlit/secrets.toml` a GitHub.
+No hace falta ningún XML.
 
-En Streamlit Community Cloud:
+## Envío por correo
 
-1. Abre tu aplicación.
-2. Entra en **App settings / Settings**.
-3. Abre **Secrets**.
-4. Añade:
+No pongas contraseñas en GitHub.
+
+En Streamlit Community Cloud abre la configuración de la app y añade en
+**Secrets**:
 
 ```toml
 [email]
@@ -49,12 +51,16 @@ sender = "TU_CUENTA_GMAIL@gmail.com"
 app_password = "CONTRASENA_DE_APLICACION_DE_GOOGLE"
 ```
 
-El destinatario está fijado en la aplicación como:
+El destinatario está fijado en `app.py` como:
 
 `alessandro.indelicato.a@gmail.com`
 
 ## Despliegue
 
-Main file path:
+En Streamlit Cloud:
 
-`app.py`
+- Branch: `main`
+- Main file path: `app.py`
+
+Si ya tenías una versión desplegada, sustituye los archivos, haz Commit y
+después reinicia la aplicación.
