@@ -602,7 +602,7 @@ def professor_panel():
         default_end = end or (
             now.replace(second=0, microsecond=0)
             + pd.Timedelta(minutes=60)
-        ).to_pydatetime()
+        )
 
         start_date = st.date_input(
             "Fecha de apertura",
@@ -678,12 +678,12 @@ def professor_panel():
             ):
                 end_dt = end or (
                     now + pd.Timedelta(minutes=60)
-                ).to_pydatetime()
+                )
 
                 if end_dt <= now:
                     end_dt = (
                         now + pd.Timedelta(minutes=60)
-                    ).to_pydatetime()
+                    )
 
                 save_test_control({
                     "enabled": True,
