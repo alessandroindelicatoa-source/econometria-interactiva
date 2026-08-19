@@ -64,3 +64,21 @@ En Streamlit Cloud:
 
 Si ya tenías una versión desplegada, sustituye los archivos, haz Commit y
 después reinicia la aplicación.
+
+
+## Datos de los ejercicios
+
+La aplicación NO incluye ningún dataset demo.
+
+Para usar:
+
+- Laboratorio MCO
+- Contrastes
+- Diagnóstico
+- Generador Gretl
+
+el estudiante debe subir su propia base en formato `CSV` o `XLSX`.
+
+El único Excel incluido en el repositorio es
+`Banco_preguntas_MooVi_Econometria.xlsx`, que contiene el banco docente
+de 1.750 preguntas del Mini-test y no es una base de datos demo.

@@ -1,13 +1,11 @@
 import math
 import csv
-import html
 import io
 import random
 import re
 import smtplib
 import ssl
 import uuid
-import xml.etree.ElementTree as ET
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -83,51 +81,60 @@ st.markdown("""
 
 
 # ============================================================
-# DATOS DEMO
+# CARGA DE DATOS DEL ALUMNO
 # ============================================================
 
-@st.cache_data
-def make_demo_data():
-    rng = np.random.default_rng(2026)
-    n = 140
+def load_uploaded_dataset(uploaded_file):
+    """Lee una base CSV o XLSX subida por el usuario."""
+    if uploaded_file is None:
+        return None
 
-    publicidad = rng.gamma(3.2, 2.2, n) + 0.8
-    superficie = np.clip(rng.normal(220, 75, n), 60, 480)
-    precio = np.clip(rng.normal(18.5, 2.8, n), 11, 27)
-    competencia = rng.integers(0, 9, n)
-    empleados = np.clip(
-        np.round(superficie / 42 + rng.normal(0, 1.4, n)),
-        2,
-        16
-    ).astype(int)
-    zona_centro = rng.binomial(1, 0.42, n)
+    filename = uploaded_file.name.lower()
 
-    sigma = 8 + 0.035 * superficie
-    error = rng.normal(0, sigma)
+    if filename.endswith(".csv"):
+        # Intento estándar; si el separador es ;, pandas lo detecta con engine=python.
+        try:
+            return pd.read_csv(uploaded_file)
+        except Exception:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, sep=None, engine="python")
 
-    ventas = (
-        28
-        + 4.6 * publicidad
-        + 0.18 * superficie
-        - 3.15 * precio
-        - 2.4 * competencia
-        + 1.7 * empleados
-        + 9.0 * zona_centro
-        + error
+    if filename.endswith(".xlsx"):
+        return pd.read_excel(uploaded_file, engine="openpyxl")
+
+    raise ValueError("Formato no compatible. Utiliza CSV o XLSX.")
+
+
+def require_uploaded_dataset(key, label="Sube la base de datos"):
+    """
+    Obliga a subir una base antes de utilizar un laboratorio.
+    No existe ningún dataset demo o automático.
+    """
+    uploaded = st.file_uploader(
+        label,
+        type=["csv", "xlsx"],
+        key=key,
+        help="La base se utiliza únicamente durante esta sesión de la aplicación.",
     )
 
-    beneficio = ventas * rng.uniform(0.13, 0.24, n) - 0.45 * publicidad
+    if uploaded is None:
+        st.info(
+            "⬆️ Sube una base de datos en formato CSV o XLSX para continuar."
+        )
+        st.stop()
 
-    return pd.DataFrame({
-        "ventas_miles_eur": np.round(ventas, 2),
-        "publicidad_miles_eur": np.round(publicidad, 2),
-        "superficie_m2": np.round(superficie, 1),
-        "precio_medio_eur": np.round(precio, 2),
-        "competidores_1km": competencia,
-        "empleados": empleados,
-        "zona_centro": zona_centro,
-        "beneficio_miles_eur": np.round(beneficio, 2),
-    })
+    try:
+        df = load_uploaded_dataset(uploaded)
+    except Exception as exc:
+        st.error("No se pudo leer la base de datos.")
+        st.code(str(exc), language="text")
+        st.stop()
+
+    if df is None or df.empty:
+        st.error("La base está vacía.")
+        st.stop()
+
+    return df, uploaded.name
 
 
 def numeric_columns(df):
@@ -180,11 +187,11 @@ def equation_text(model, y):
     return f"{y} = " + "".join(pieces)
 
 
-def gretl_script(y, xs):
+def gretl_script(y, xs, filename="datos.csv"):
     regressors = " ".join(xs)
     return f"""# ECONOMETRÍA · SCRIPT BASE GRETl
 
-open datos.csv
+open {filename}
 
 # 1. Descriptivos
 summary {y} {regressors}
@@ -223,83 +230,115 @@ FICHA_LABELS = {
 LABEL_TO_FICHA = {v: k for k, v in FICHA_LABELS.items()}
 
 
-def _clean_html(value):
-    if value is None:
+def _safe_text(value):
+    if pd.isna(value):
         return ""
-    value = re.sub(r"<br\s*/?>", " ", value, flags=re.I)
-    value = re.sub(r"<[^>]+>", "", value)
-    return html.unescape(value).strip()
+    return str(value).strip()
 
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_question_bank():
+    """Carga las 1.750 preguntas desde la hoja 'Todas' del banco Excel."""
     bank_path = Path(__file__).resolve().parent / BANK_FILENAME
 
     if not bank_path.exists():
-        return []
+        raise FileNotFoundError(
+            f"No se encuentra `{BANK_FILENAME}` en la raíz del repositorio."
+        )
 
-    tree = ET.parse(bank_path)
-    root_xml = tree.getroot()
+    try:
+        df_bank = pd.read_excel(
+            bank_path,
+            sheet_name="Todas",
+            engine="openpyxl",
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "No se pudo abrir el banco de preguntas. "
+            "Comprueba que el Excel contiene una hoja llamada `Todas`."
+        ) from exc
+
+    required = [
+        "ID",
+        "Ficha",
+        "Tema",
+        "Pregunta",
+        "Opción A",
+        "Opción B",
+        "Opción C",
+        "Opción D",
+        "Correcta",
+        "Respuesta correcta",
+    ]
+
+    missing = [c for c in required if c not in df_bank.columns]
+
+    if missing:
+        raise ValueError(
+            "Faltan columnas en el banco: " + ", ".join(missing)
+        )
+
+    option_columns = {
+        "A": "Opción A",
+        "B": "Opción B",
+        "C": "Opción C",
+        "D": "Opción D",
+    }
+
     bank = []
 
-    for question in root_xml.findall("question"):
-        if question.get("type") != "multichoice":
-            continue
+    for _, row in df_bank.iterrows():
+        qid = _safe_text(row["ID"])
+        ficha = _safe_text(row["Ficha"])
+        tema = _safe_text(row["Tema"])
+        question_text = _safe_text(row["Pregunta"])
+        correct_letter = _safe_text(row["Correcta"]).upper()
 
-        qid = _clean_html(
-            question.findtext("idnumber")
-            or question.findtext("name/text")
-        )
+        option_by_letter = {
+            letter: _safe_text(row[column])
+            for letter, column in option_columns.items()
+        }
 
-        qtext = _clean_html(question.findtext("questiontext/text"))
-
-        tag_values = [
-            _clean_html(node.findtext("text"))
-            for node in question.findall("tags/tag")
+        options = [
+            value for value in option_by_letter.values()
+            if value
         ]
 
-        ficha = next(
-            (t for t in tag_values if re.fullmatch(r"Ficha\d{2}", t)),
-            qid.split("-")[0] if qid.startswith("Ficha") else ""
+        correct_answer = _safe_text(row["Respuesta correcta"])
+
+        if not correct_answer:
+            correct_answer = option_by_letter.get(correct_letter, "")
+
+        explanation = (
+            _safe_text(row["Explicación"])
+            if "Explicación" in df_bank.columns
+            else ""
         )
 
-        difficulty = next(
-            (t for t in tag_values if t in {"Baja", "Media", "Alta"}),
-            ""
-        )
-
-        topic_candidates = [
-            t for t in tag_values
-            if t and t != ficha and t != difficulty
-        ]
-        topic = topic_candidates[0] if topic_candidates else ""
-
-        options = []
-        correct_answer = None
-
-        for answer in question.findall("answer"):
-            answer_text = _clean_html(answer.findtext("text"))
-            fraction = float(answer.get("fraction", "0") or 0)
-
-            if answer_text:
-                options.append(answer_text)
-
-            if fraction >= 99.999:
-                correct_answer = answer_text
-
-        if qtext and len(options) >= 2 and correct_answer:
+        if (
+            qid
+            and ficha
+            and question_text
+            and len(options) >= 2
+            and correct_answer
+        ):
             bank.append({
                 "id": qid,
                 "ficha": ficha,
-                "tema": topic,
-                "dificultad": difficulty,
-                "pregunta": qtext,
+                "tema": tema,
+                "dificultad": "",
+                "pregunta": question_text,
                 "opciones": options,
                 "correcta": correct_answer,
+                "explicacion": explanation,
             })
 
-    return bank
+    if not bank:
+        raise ValueError(
+            "El Excel se abrió correctamente, pero no contiene preguntas válidas."
+        )
 
+    return bank
 
 def build_submission_csv(student, attempt_id, selected_labels, questions, responses, score):
     output = io.StringIO()
@@ -455,7 +494,7 @@ if section == "🏠 Inicio":
     c1.metric("Bloques", "6")
     c2.metric("Laboratorios", "5")
     c3.metric("Mini-test", "10 preguntas")
-    c4.metric("Caso demo", "ADE")
+    c4.metric("Datos", "CSV / XLSX")
 
     st.subheader("Cómo vamos a trabajar")
 
@@ -637,24 +676,16 @@ elif section == "📈 Laboratorio MCO":
 
     st.title("📈 Laboratorio de regresión MCO")
     st.write(
-        "Carga tus datos o utiliza el caso demo de establecimientos comerciales."
+        "Sube la base de datos con la que vas a trabajar en clase."
     )
 
-    uploaded = st.file_uploader("CSV del alumno", type=["csv"])
-
-    if uploaded is not None:
-        try:
-            df = pd.read_csv(uploaded)
-            source = "CSV cargado"
-        except Exception as exc:
-            st.error(f"No pude leer el CSV: {exc}")
-            st.stop()
-    else:
-        df = make_demo_data()
-        source = "Caso demo ADE"
+    df, source = require_uploaded_dataset(
+        key="lab_dataset",
+        label="Sube la base de datos del ejercicio",
+    )
 
     st.caption(
-        f"Fuente activa: **{source}** · "
+        f"Archivo activo: **{source}** · "
         f"{len(df)} observaciones · {df.shape[1]} variables"
     )
 
@@ -666,11 +697,7 @@ elif section == "📈 Laboratorio MCO":
         st.error("La base necesita al menos dos variables numéricas.")
         st.stop()
 
-    default_y = (
-        num.index("ventas_miles_eur")
-        if "ventas_miles_eur" in num
-        else 0
-    )
+    default_y = 0
 
     y = st.selectbox(
         "Variable dependiente (Y)",
@@ -680,16 +707,7 @@ elif section == "📈 Laboratorio MCO":
 
     x_candidates = [c for c in num if c != y]
 
-    defaults = [
-        c
-        for c in [
-            "publicidad_miles_eur",
-            "superficie_m2",
-            "precio_medio_eur",
-            "competidores_1km",
-        ]
-        if c in x_candidates
-    ]
+    defaults = x_candidates[: min(2, len(x_candidates))]
 
     xs = st.multiselect(
         "Variables explicativas (X)",
@@ -942,14 +960,14 @@ elif section == "🧪 Contrastes e IC":
         "Experimenta con H₀ y observa cómo cambian t, p-valor y decisión."
     )
 
-    df = make_demo_data()
+    df, source = require_uploaded_dataset(
+        key="contrast_dataset",
+        label="Sube la base de datos para el contraste",
+    )
+    st.caption(f"Archivo activo: **{source}**")
     num = numeric_columns(df)
 
-    default_y = (
-        num.index("ventas_miles_eur")
-        if "ventas_miles_eur" in num
-        else 0
-    )
+    default_y = 0
 
     y = st.selectbox(
         "Y",
@@ -960,16 +978,7 @@ elif section == "🧪 Contrastes e IC":
 
     xs_all = [c for c in num if c != y]
 
-    defaults = [
-        c
-        for c in [
-            "publicidad_miles_eur",
-            "superficie_m2",
-            "precio_medio_eur",
-            "competidores_1km",
-        ]
-        if c in xs_all
-    ]
+    defaults = xs_all[: min(2, len(xs_all))]
 
     xs = st.multiselect(
         "X",
@@ -1058,14 +1067,14 @@ elif section == "🩺 Diagnóstico":
         "Cada prueba responde a una pregunta distinta sobre el modelo."
     )
 
-    df = make_demo_data()
+    df, source = require_uploaded_dataset(
+        key="diag_dataset",
+        label="Sube la base de datos para el diagnóstico",
+    )
+    st.caption(f"Archivo activo: **{source}**")
     num = numeric_columns(df)
 
-    default_y = (
-        num.index("ventas_miles_eur")
-        if "ventas_miles_eur" in num
-        else 0
-    )
+    default_y = 0
 
     y = st.selectbox(
         "Y",
@@ -1076,16 +1085,7 @@ elif section == "🩺 Diagnóstico":
 
     xs_all = [c for c in num if c != y]
 
-    defaults = [
-        c
-        for c in [
-            "publicidad_miles_eur",
-            "superficie_m2",
-            "precio_medio_eur",
-            "competidores_1km",
-        ]
-        if c in xs_all
-    ]
+    defaults = xs_all[: min(2, len(xs_all))]
 
     xs = st.multiselect(
         "X",
@@ -1258,14 +1258,14 @@ elif section == "⌨️ Gretl":
         "Selecciona un modelo y genera una plantilla reproducible."
     )
 
-    df = make_demo_data()
+    df, source = require_uploaded_dataset(
+        key="gretl_dataset",
+        label="Sube la base de datos para generar el script",
+    )
+    st.caption(f"Archivo activo: **{source}**")
     num = numeric_columns(df)
 
-    default_y = (
-        num.index("ventas_miles_eur")
-        if "ventas_miles_eur" in num
-        else 0
-    )
+    default_y = 0
 
     y = st.selectbox(
         "Variable dependiente",
@@ -1276,16 +1276,7 @@ elif section == "⌨️ Gretl":
 
     xs_all = [c for c in num if c != y]
 
-    defaults = [
-        c
-        for c in [
-            "publicidad_miles_eur",
-            "superficie_m2",
-            "precio_medio_eur",
-            "competidores_1km",
-        ]
-        if c in xs_all
-    ]
+    defaults = xs_all[: min(2, len(xs_all))]
 
     xs = st.multiselect(
         "Explicativas",
@@ -1295,7 +1286,7 @@ elif section == "⌨️ Gretl":
     )
 
     if xs:
-        script = gretl_script(y, xs)
+        script = gretl_script(y, xs, filename=source)
 
         st.code(
             script,
@@ -1341,12 +1332,14 @@ elif section == "✅ Mini-test":
         "La prueba se envía al profesor; no se muestra la calificación ni las soluciones."
     )
 
-    bank = load_question_bank()
-
-    if not bank:
-        st.error(
-            f"No encuentro el banco `{BANK_FILENAME}` en la raíz del repositorio. "
-            "Sube ese XML a GitHub junto a app.py."
+    try:
+        bank = load_question_bank()
+    except Exception as exc:
+        st.error("No se pudo cargar el banco de preguntas.")
+        st.code(str(exc), language="text")
+        st.info(
+            f"Debe existir `{BANK_FILENAME}` en la raíz del repositorio "
+            "y contener la hoja `Todas`."
         )
         st.stop()
 
