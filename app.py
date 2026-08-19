@@ -8,6 +8,8 @@ import ssl
 import uuid
 import json
 import tempfile
+import hashlib
+import sqlite3
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 from email.message import EmailMessage
@@ -343,11 +345,12 @@ def load_question_bank():
 
     return bank
 
-def build_submission_csv(student, attempt_id, selected_labels, questions, responses, score):
+def build_submission_csv(student, exam_id, attempt_id, selected_labels, questions, responses, score):
     output = io.StringIO()
     writer = csv.writer(output, delimiter=";")
 
     writer.writerow(["ECONOMETRÍA · MINI-TEST"])
+    writer.writerow(["ID convocatoria", exam_id])
     writer.writerow(["ID intento", attempt_id])
     writer.writerow(["Fecha/hora", datetime.now().astimezone().isoformat(timespec="seconds")])
     writer.writerow(["Nombre y apellidos", student["name"]])
@@ -389,7 +392,7 @@ def build_submission_csv(student, attempt_id, selected_labels, questions, respon
     return output.getvalue().encode("utf-8-sig")
 
 
-def send_submission_email(csv_bytes, student, attempt_id, score, n_questions):
+def send_submission_email(csv_bytes, student, exam_id, attempt_id, score, n_questions):
     try:
         email_cfg = st.secrets["email"]
         sender = email_cfg["sender"]
@@ -418,6 +421,7 @@ def send_submission_email(csv_bytes, student, attempt_id, score, n_questions):
         f"Correo UVigo: {student['email']}\n"
         f"Grupo: {student['group'] or 'No indicado'}\n"
         f"Resultado docente: {score}/{n_questions}\n"
+        f"ID convocatoria: {exam_id}\n"
         f"ID de intento: {attempt_id}\n\n"
         "El CSV adjunto contiene las preguntas, respuestas del estudiante "
         "y la corrección completa."
@@ -446,6 +450,8 @@ def reset_quiz_state():
     for key in [
         "quiz_questions",
         "quiz_attempt_id",
+        "quiz_exam_id",
+        "quiz_participant_key",
         "quiz_selected_labels",
         "quiz_selected_topics",
         "quiz_submitted",
@@ -461,11 +467,154 @@ def reset_quiz_state():
 
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 TEST_CONTROL_FILE = Path(tempfile.gettempdir()) / "econometria_test_control.json"
+ATTEMPT_DB_FILE = Path(tempfile.gettempdir()) / "econometria_attempts.sqlite3"
+
+
+def init_attempt_db():
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS attempts (
+                exam_id TEXT NOT NULL,
+                participant_key TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                questions_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                submitted_at TEXT,
+                PRIMARY KEY (exam_id, participant_key)
+            )
+        """)
+        conn.commit()
+
+
+def normalize_identifier(value):
+    return re.sub(r"[^A-Z0-9]", "", str(value).upper())
+
+
+def make_participant_key(dni, nie):
+    """
+    El registro compartido no guarda DNI/NIE en claro.
+    Se usa únicamente un hash de ambos identificadores.
+    """
+    raw = (
+        normalize_identifier(dni)
+        + "|"
+        + normalize_identifier(nie)
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_saved_attempt(exam_id, participant_key):
+    init_attempt_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        row = conn.execute(
+            """
+            SELECT attempt_id, status, questions_json
+            FROM attempts
+            WHERE exam_id = ? AND participant_key = ?
+            """,
+            (exam_id, participant_key),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "attempt_id": row[0],
+        "status": row[1],
+        "questions": json.loads(row[2]),
+    }
+
+
+def register_attempt(exam_id, participant_key, attempt_id, questions):
+    """
+    INSERT OR IGNORE garantiza un único intento incluso si dos pestañas
+    intentan iniciarlo casi al mismo tiempo.
+    """
+    init_attempt_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO attempts
+            (
+                exam_id,
+                participant_key,
+                attempt_id,
+                status,
+                questions_json,
+                created_at
+            )
+            VALUES (?, ?, ?, 'started', ?, ?)
+            """,
+            (
+                exam_id,
+                participant_key,
+                attempt_id,
+                json.dumps(questions, ensure_ascii=False),
+                datetime.now(MADRID_TZ).isoformat(),
+            ),
+        )
+        conn.commit()
+
+    return get_saved_attempt(exam_id, participant_key)
+
+
+def mark_attempt_submitted(exam_id, participant_key):
+    init_attempt_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        conn.execute(
+            """
+            UPDATE attempts
+            SET status = 'submitted',
+                submitted_at = ?
+            WHERE exam_id = ? AND participant_key = ?
+            """,
+            (
+                datetime.now(MADRID_TZ).isoformat(),
+                exam_id,
+                participant_key,
+            ),
+        )
+        conn.commit()
+
+
+def get_attempt_counts(exam_id):
+    if not exam_id:
+        return 0, 0
+
+    init_attempt_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        started = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM attempts
+            WHERE exam_id = ?
+            """,
+            (exam_id,),
+        ).fetchone()[0]
+
+        submitted = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM attempts
+            WHERE exam_id = ?
+              AND status = 'submitted'
+            """,
+            (exam_id,),
+        ).fetchone()[0]
+
+    return int(started), int(submitted)
+
 
 
 def default_test_control():
     return {
         "enabled": False,
+        "exam_id": None,
         "start": None,
         "end": None,
         "selected_fichas": [],
@@ -726,8 +875,11 @@ def professor_panel():
                         "Selecciona al menos una ficha antes de activar el examen."
                     )
                 else:
+                    new_exam_id = str(uuid.uuid4())
+
                     save_test_control({
                         "enabled": True,
+                        "exam_id": new_exam_id,
                         "start": start_dt.isoformat(),
                         "end": end_dt.isoformat(),
                         "selected_fichas": selected_fichas_prof,
@@ -761,8 +913,11 @@ def professor_panel():
                         "Selecciona al menos una ficha antes de abrir el examen."
                     )
                 else:
+                    new_exam_id = str(uuid.uuid4())
+
                     save_test_control({
                         "enabled": True,
+                        "exam_id": new_exam_id,
                         "start": now.isoformat(),
                         "end": end_dt.isoformat(),
                         "selected_fichas": selected_fichas_prof,
@@ -779,6 +934,7 @@ def professor_panel():
             ):
                 save_test_control({
                     "enabled": False,
+                    "exam_id": control.get("exam_id"),
                     "start": control.get("start"),
                     "end": control.get("end"),
                     "selected_fichas": control.get("selected_fichas", []),
@@ -794,6 +950,17 @@ def professor_panel():
                 f"{format_madrid_datetime(start)}\n\n"
                 "Cierre: "
                 f"{format_madrid_datetime(end)}"
+            )
+
+        current_exam_id = control.get("exam_id")
+        if current_exam_id:
+            attempts_started, attempts_submitted = get_attempt_counts(
+                current_exam_id
+            )
+            st.caption(
+                f"Convocatoria: {current_exam_id[:8]} · "
+                f"Intentos iniciados: {attempts_started} · "
+                f"Enviados: {attempts_submitted}"
             )
 
         configured_fichas = control.get("selected_fichas") or []
@@ -1824,9 +1991,25 @@ elif section == "✅ Mini-test":
 
     status_gate, control_gate, _, _, _ = get_test_gate_status()
 
+    exam_id = control_gate.get("exam_id")
     selected_fichas = control_gate.get("selected_fichas") or []
     selected_topics = control_gate.get("selected_topics") or []
     n_questions = int(control_gate.get("n_questions") or 10)
+
+    if not exam_id:
+        st.error(
+            "La convocatoria no está correctamente inicializada. "
+            "El profesor debe cerrar y volver a abrir el test."
+        )
+        st.stop()
+
+    # Si el profesor ha abierto una convocatoria nueva, no se reutiliza
+    # ningún estado de una convocatoria anterior.
+    if (
+        "quiz_exam_id" in st.session_state
+        and st.session_state.quiz_exam_id != exam_id
+    ):
+        reset_quiz_state()
 
     if not selected_fichas:
         st.error(
@@ -1848,61 +2031,147 @@ elif section == "✅ Mini-test":
             use_container_width=True,
         ):
 
-            if not selected_fichas:
-                st.warning("Selecciona al menos una parte del temario.")
-
-            elif (
+            if (
                 not student_name.strip()
                 or not student_dni.strip()
                 or not student_nie.strip()
                 or not student_email.strip()
             ):
                 st.warning(
-                    "Introduce nombre y apellidos, DNI, NIE y correo UVigo antes de generar la prueba."
+                    "Introduce nombre y apellidos, DNI, NIE y correo UVigo "
+                    "antes de iniciar la prueba."
                 )
 
             else:
-                candidates = [
-                    q for q in bank
-                    if q["ficha"] in selected_fichas
-                    and (
-                        not selected_topics
-                        or q["tema"] in selected_topics
-                    )
-                ]
+                participant_key = make_participant_key(
+                    student_dni,
+                    student_nie,
+                )
 
-                if not candidates:
-                    st.warning(
-                        "No hay preguntas disponibles con esa combinación de temario."
+                saved_attempt = get_saved_attempt(
+                    exam_id,
+                    participant_key,
+                )
+
+                # Ya terminó esta convocatoria: no puede iniciar otra.
+                if (
+                    saved_attempt
+                    and saved_attempt["status"] == "submitted"
+                ):
+                    st.error(
+                        "⛔ Ya has realizado el único intento permitido "
+                        "para esta convocatoria."
                     )
+
+                # Empezó antes pero no envió: recupera exactamente
+                # las mismas preguntas y el mismo orden.
+                elif saved_attempt:
+                    st.session_state.quiz_questions = (
+                        saved_attempt["questions"]
+                    )
+                    st.session_state.quiz_attempt_id = (
+                        saved_attempt["attempt_id"]
+                    )
+                    st.session_state.quiz_exam_id = exam_id
+                    st.session_state.quiz_participant_key = (
+                        participant_key
+                    )
+                    st.session_state.quiz_selected_labels = (
+                        selected_labels
+                    )
+                    st.session_state.quiz_selected_topics = (
+                        selected_topics
+                    )
+                    st.session_state.quiz_submitted = False
+
+                    st.info(
+                        "Se ha recuperado tu intento ya iniciado. "
+                        "No se han generado preguntas nuevas."
+                    )
+                    st.rerun()
 
                 else:
-                    k = min(n_questions, len(candidates))
-                    chosen = random.SystemRandom().sample(candidates, k)
+                    candidates = [
+                        q for q in bank
+                        if q["ficha"] in selected_fichas
+                        and (
+                            not selected_topics
+                            or q["tema"] in selected_topics
+                        )
+                    ]
 
-                    # Cada estudiante obtiene un intento independiente.
-                    # Las preguntas y las opciones se aleatorizan de nuevo para cada sesión.
-                    attempt_id = str(uuid.uuid4())
-                    secure_random = random.SystemRandom()
+                    if not candidates:
+                        st.warning(
+                            "No hay preguntas disponibles para "
+                            "la configuración del profesor."
+                        )
 
-                    frozen_questions = []
+                    else:
+                        k = min(
+                            n_questions,
+                            len(candidates),
+                        )
 
-                    for q in chosen:
-                        qcopy = dict(q)
-                        shuffled = list(qcopy["opciones"])
-                        secure_random.shuffle(shuffled)
-                        qcopy["opciones"] = shuffled
-                        frozen_questions.append(qcopy)
+                        secure_random = random.SystemRandom()
 
-                    # También se aleatoriza el orden final de las preguntas del intento.
-                    secure_random.shuffle(frozen_questions)
+                        chosen = secure_random.sample(
+                            candidates,
+                            k,
+                        )
 
-                    st.session_state.quiz_questions = frozen_questions
-                    st.session_state.quiz_attempt_id = attempt_id
-                    st.session_state.quiz_selected_labels = selected_labels
-                    st.session_state.quiz_selected_topics = selected_topics
-                    st.session_state.quiz_submitted = False
-                    st.rerun()
+                        attempt_id = str(uuid.uuid4())
+                        frozen_questions = []
+
+                        for q in chosen:
+                            qcopy = dict(q)
+                            shuffled = list(
+                                qcopy["opciones"]
+                            )
+                            secure_random.shuffle(
+                                shuffled
+                            )
+                            qcopy["opciones"] = shuffled
+                            frozen_questions.append(
+                                qcopy
+                            )
+
+                        secure_random.shuffle(
+                            frozen_questions
+                        )
+
+                        # Registro atómico: solo un intento puede existir
+                        # para este DNI+NIE en esta convocatoria.
+                        registered = register_attempt(
+                            exam_id=exam_id,
+                            participant_key=participant_key,
+                            attempt_id=attempt_id,
+                            questions=frozen_questions,
+                        )
+
+                        if registered["status"] == "submitted":
+                            st.error(
+                                "⛔ Ya has realizado el único intento "
+                                "permitido para esta convocatoria."
+                            )
+                        else:
+                            st.session_state.quiz_questions = (
+                                registered["questions"]
+                            )
+                            st.session_state.quiz_attempt_id = (
+                                registered["attempt_id"]
+                            )
+                            st.session_state.quiz_exam_id = exam_id
+                            st.session_state.quiz_participant_key = (
+                                participant_key
+                            )
+                            st.session_state.quiz_selected_labels = (
+                                selected_labels
+                            )
+                            st.session_state.quiz_selected_topics = (
+                                selected_topics
+                            )
+                            st.session_state.quiz_submitted = False
+                            st.rerun()
 
     # --------------------------------------------------------
     # Test congelado
@@ -1918,8 +2187,9 @@ elif section == "✅ Mini-test":
 
         st.info(
             f"Se han seleccionado {len(questions)} preguntas al azar. "
-            "El orden de las preguntas y de las respuestas es diferente para cada estudiante "
-            "y permanece fijo únicamente durante su propio intento."
+            "Cada estudiante dispone de un único intento en esta convocatoria. "
+            "Si recargas o vuelves a entrar, recuperarás estas mismas preguntas "
+            "y el mismo orden."
         )
 
         if st.session_state.get("quiz_submitted", False):
@@ -1927,12 +2197,9 @@ elif section == "✅ Mini-test":
                 "✅ Prueba enviada correctamente al profesor."
             )
             st.write(
+                "Has utilizado el único intento permitido para esta convocatoria. "
                 "No se muestra la puntuación ni las respuestas correctas."
             )
-
-            if st.button("Hacer un nuevo test"):
-                reset_quiz_state()
-                st.rerun()
 
         else:
             with st.form("student_quiz_form"):
@@ -1988,8 +2255,12 @@ elif section == "✅ Mini-test":
                         "group": student_group.strip(),
                     }
 
+                    current_exam_id = st.session_state.quiz_exam_id
+                    participant_key = st.session_state.quiz_participant_key
+
                     csv_bytes = build_submission_csv(
                         student=student,
+                        exam_id=current_exam_id,
                         attempt_id=attempt_id,
                         selected_labels=st.session_state.quiz_selected_labels,
                         questions=questions,
@@ -2001,6 +2272,7 @@ elif section == "✅ Mini-test":
                         send_submission_email(
                             csv_bytes=csv_bytes,
                             student=student,
+                            exam_id=current_exam_id,
                             attempt_id=attempt_id,
                             score=score,
                             n_questions=len(questions),
@@ -2013,5 +2285,9 @@ elif section == "✅ Mini-test":
                         )
 
                     else:
+                        mark_attempt_submitted(
+                            current_exam_id,
+                            participant_key,
+                        )
                         st.session_state.quiz_submitted = True
                         st.rerun()
