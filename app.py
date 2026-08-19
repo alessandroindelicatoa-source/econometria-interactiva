@@ -413,7 +413,7 @@ def reset_quiz_state():
 # ============================================================
 
 st.sidebar.markdown("## 📈 Econometría")
-st.sidebar.caption("ADE · Universidade de Vigo")
+st.sidebar.caption("Universidade de Vigo")
 
 section = st.sidebar.radio(
     "Navegación",
