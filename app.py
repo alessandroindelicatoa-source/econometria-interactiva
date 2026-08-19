@@ -218,7 +218,7 @@ modtest --white
 # ============================================================
 
 BANK_FILENAME = "Banco_preguntas_MooVi_Econometria.xlsx"
-TEACHER_EMAIL = "alessandro.indelicato.a@gmail.com"
+TEACHER_EMAIL = "alessandro.indelicato.examen@gmail.com"
 
 FICHA_LABELS = {
     "Ficha00": "Ficha00 · Introducción a Gretl y entorno de trabajo",
@@ -468,6 +468,9 @@ def default_test_control():
         "enabled": False,
         "start": None,
         "end": None,
+        "selected_fichas": [],
+        "selected_topics": [],
+        "n_questions": 10,
         "updated_at": None,
     }
 
@@ -595,6 +598,66 @@ def professor_panel():
             f"Ahora en Madrid: {format_madrid_datetime(now)}"
         )
 
+        # --------------------------------------------------------
+        # Configuración docente del contenido del examen
+        # --------------------------------------------------------
+        try:
+            professor_bank = load_question_bank()
+        except Exception as exc:
+            st.error("No se pudo cargar el banco de preguntas.")
+            st.code(str(exc), language="text")
+            return
+
+        current_fichas = control.get("selected_fichas") or []
+        current_labels = [
+            FICHA_LABELS[f]
+            for f in current_fichas
+            if f in FICHA_LABELS
+        ]
+
+        selected_labels_prof = st.multiselect(
+            "Ficha(s) que entran en el examen",
+            options=list(FICHA_LABELS.values()),
+            default=current_labels,
+            key="prof_exam_fichas",
+        )
+
+        selected_fichas_prof = [
+            LABEL_TO_FICHA[label]
+            for label in selected_labels_prof
+        ]
+
+        available_topics_prof = sorted({
+            q["tema"]
+            for q in professor_bank
+            if q["ficha"] in selected_fichas_prof and q["tema"]
+        })
+
+        saved_topics = [
+            topic
+            for topic in (control.get("selected_topics") or [])
+            if topic in available_topics_prof
+        ]
+
+        selected_topics_prof = st.multiselect(
+            "Tema(s) que entran",
+            options=available_topics_prof,
+            default=saved_topics,
+            help=(
+                "Si lo dejas vacío, entran todos los temas "
+                "de las fichas seleccionadas."
+            ),
+            key="prof_exam_topics",
+        )
+
+        n_questions_prof = st.slider(
+            "Número de preguntas",
+            min_value=1,
+            max_value=10,
+            value=int(control.get("n_questions") or 10),
+            key="prof_exam_n_questions",
+        )
+
         default_start = start or now.replace(
             second=0,
             microsecond=0,
@@ -658,16 +721,24 @@ def professor_panel():
                     "a la de apertura."
                 )
             else:
-                save_test_control({
-                    "enabled": True,
-                    "start": start_dt.isoformat(),
-                    "end": end_dt.isoformat(),
-                    "updated_at": datetime.now(
-                        MADRID_TZ
-                    ).isoformat(),
-                })
-                st.success("Mini-test programado.")
-                st.rerun()
+                if not selected_fichas_prof:
+                    st.error(
+                        "Selecciona al menos una ficha antes de activar el examen."
+                    )
+                else:
+                    save_test_control({
+                        "enabled": True,
+                        "start": start_dt.isoformat(),
+                        "end": end_dt.isoformat(),
+                        "selected_fichas": selected_fichas_prof,
+                        "selected_topics": selected_topics_prof,
+                        "n_questions": n_questions_prof,
+                        "updated_at": datetime.now(
+                            MADRID_TZ
+                        ).isoformat(),
+                    })
+                    st.success("Mini-test programado.")
+                    st.rerun()
 
         c1, c2 = st.columns(2)
 
@@ -685,13 +756,21 @@ def professor_panel():
                         now + pd.Timedelta(minutes=60)
                     )
 
-                save_test_control({
-                    "enabled": True,
-                    "start": now.isoformat(),
-                    "end": end_dt.isoformat(),
-                    "updated_at": now.isoformat(),
-                })
-                st.rerun()
+                if not selected_fichas_prof:
+                    st.error(
+                        "Selecciona al menos una ficha antes de abrir el examen."
+                    )
+                else:
+                    save_test_control({
+                        "enabled": True,
+                        "start": now.isoformat(),
+                        "end": end_dt.isoformat(),
+                        "selected_fichas": selected_fichas_prof,
+                        "selected_topics": selected_topics_prof,
+                        "n_questions": n_questions_prof,
+                        "updated_at": now.isoformat(),
+                    })
+                    st.rerun()
 
         with c2:
             if st.button(
@@ -702,6 +781,9 @@ def professor_panel():
                     "enabled": False,
                     "start": control.get("start"),
                     "end": control.get("end"),
+                    "selected_fichas": control.get("selected_fichas", []),
+                    "selected_topics": control.get("selected_topics", []),
+                    "n_questions": control.get("n_questions", 10),
                     "updated_at": now.isoformat(),
                 })
                 st.rerun()
@@ -712,6 +794,29 @@ def professor_panel():
                 f"{format_madrid_datetime(start)}\n\n"
                 "Cierre: "
                 f"{format_madrid_datetime(end)}"
+            )
+
+        configured_fichas = control.get("selected_fichas") or []
+        configured_topics = control.get("selected_topics") or []
+
+        if configured_fichas:
+            st.markdown(
+                "**Contenido activo:** "
+                + ", ".join(
+                    FICHA_LABELS.get(f, f)
+                    for f in configured_fichas
+                )
+            )
+            if configured_topics:
+                st.caption(
+                    "Temas: " + " · ".join(configured_topics)
+                )
+            else:
+                st.caption(
+                    "Temas: todos los de las fichas seleccionadas"
+                )
+            st.caption(
+                f"Preguntas por intento: {int(control.get('n_questions') or 10)}"
             )
 
         st.warning(
@@ -1714,49 +1819,31 @@ elif section == "✅ Mini-test":
         )
 
     # --------------------------------------------------------
-    # Selección de temario
+    # Contenido fijado por el profesor
     # --------------------------------------------------------
 
-    st.subheader("2. Temario del test")
+    status_gate, control_gate, _, _, _ = get_test_gate_status()
 
-    selected_labels = st.multiselect(
-        "Selecciona una o varias partes del temario",
-        options=list(FICHA_LABELS.values()),
-        default=[],
-        disabled="quiz_questions" in st.session_state,
-    )
+    selected_fichas = control_gate.get("selected_fichas") or []
+    selected_topics = control_gate.get("selected_topics") or []
+    n_questions = int(control_gate.get("n_questions") or 10)
 
-    selected_fichas = [
-        LABEL_TO_FICHA[label]
-        for label in selected_labels
+    if not selected_fichas:
+        st.error(
+            "El profesor no ha configurado todavía el contenido del examen."
+        )
+        st.stop()
+
+    # El alumno no puede modificar ficha, tema ni número de preguntas.
+    selected_labels = [
+        FICHA_LABELS.get(f, f)
+        for f in selected_fichas
     ]
-
-    topic_pool = sorted({
-        q["tema"]
-        for q in bank
-        if q["ficha"] in selected_fichas and q["tema"]
-    })
-
-    selected_topics = st.multiselect(
-        "Temas específicos dentro de esas fichas (opcional)",
-        options=topic_pool,
-        default=[],
-        help="Si lo dejas vacío, entran todos los temas de las fichas seleccionadas.",
-        disabled="quiz_questions" in st.session_state,
-    )
-
-    n_questions = st.slider(
-        "Número de preguntas",
-        min_value=1,
-        max_value=10,
-        value=10,
-        disabled="quiz_questions" in st.session_state,
-    )
 
     if "quiz_questions" not in st.session_state:
 
         if st.button(
-            "🎲 Generar test aleatorio",
+            "▶️ Iniciar test",
             type="primary",
             use_container_width=True,
         ):
@@ -1793,17 +1880,25 @@ elif section == "✅ Mini-test":
                     k = min(n_questions, len(candidates))
                     chosen = random.SystemRandom().sample(candidates, k)
 
+                    # Cada estudiante obtiene un intento independiente.
+                    # Las preguntas y las opciones se aleatorizan de nuevo para cada sesión.
+                    attempt_id = str(uuid.uuid4())
+                    secure_random = random.SystemRandom()
+
                     frozen_questions = []
 
                     for q in chosen:
                         qcopy = dict(q)
                         shuffled = list(qcopy["opciones"])
-                        random.SystemRandom().shuffle(shuffled)
+                        secure_random.shuffle(shuffled)
                         qcopy["opciones"] = shuffled
                         frozen_questions.append(qcopy)
 
+                    # También se aleatoriza el orden final de las preguntas del intento.
+                    secure_random.shuffle(frozen_questions)
+
                     st.session_state.quiz_questions = frozen_questions
-                    st.session_state.quiz_attempt_id = str(uuid.uuid4())
+                    st.session_state.quiz_attempt_id = attempt_id
                     st.session_state.quiz_selected_labels = selected_labels
                     st.session_state.quiz_selected_topics = selected_topics
                     st.session_state.quiz_submitted = False
@@ -1819,11 +1914,12 @@ elif section == "✅ Mini-test":
         attempt_id = st.session_state.quiz_attempt_id
 
         st.divider()
-        st.subheader("3. Prueba")
+        st.subheader("2. Prueba")
 
         st.info(
             f"Se han seleccionado {len(questions)} preguntas al azar. "
-            "Las preguntas y el orden de las respuestas permanecen fijos durante este intento."
+            "El orden de las preguntas y de las respuestas es diferente para cada estudiante "
+            "y permanece fijo únicamente durante su propio intento."
         )
 
         if st.session_state.get("quiz_submitted", False):
