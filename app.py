@@ -207,7 +207,7 @@ modtest --white
 # BANCO DE PREGUNTAS Y ENVÍO DE TEST
 # ============================================================
 
-BANK_FILENAME = "MooVi_Econometria_Ficha00_Ficha06_1750.xml"
+BANK_FILENAME = "Banco_preguntas_MooVi_Econometria.xml"
 TEACHER_EMAIL = "alessandro.indelicato.a@gmail.com"
 
 FICHA_LABELS = {
