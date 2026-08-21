@@ -1480,7 +1480,7 @@ if section == "🏠 Inicio":
 
     st.markdown("""
     <div class="hero">
-      <div class="kicker">Econometría · ADE · 2026/27</div>
+      <div class="kicker">Econometría · ADE, ADE-Dereito · 2026/27</div>
       <h1>Econometría Interactiva</h1>
       <p>De la pregunta económica al modelo, la estimación,
       el diagnóstico y la interpretación.</p>
