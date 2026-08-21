@@ -1,799 +1,2791 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+import math
+import csv
+import io
+import random
+import re
+import smtplib
+import ssl
+import uuid
+import zipfile
+import json
+import tempfile
+import hashlib
+import hmac
+import sqlite3
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
+from email.message import EmailMessage
 from pathlib import Path
-from itertools import combinations
+
+import numpy as np
+import pandas as pd
+import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
-import plotly.io as pio
+import statsmodels.api as sm
 
-from econometrics_lab.data_manager import load_bytes, apply_transform, missing_summary, handle_missing
-from econometrics_lab.utils import dataframe_profile, numeric_columns, categorical_columns, build_formula
-from econometrics_lab.model_engine import (
-    fit_cross_section, fit_ordered, fit_zero_inflated_poisson, fit_panel,
-    fit_iv, fit_did, fit_arima, fit_var
-)
-from econometrics_lab.diagnostics import ols_diagnostics, vif_table, influence_table
-from econometrics_lab.plot_factory import (
-    histogram, box_violin, scatter, correlation_heatmap, scatter_matrix,
-    line_plot, group_means, missingness, coefficient_plot, actual_predicted,
-    residual_fitted, residual_hist, qq_plot, roc_plot, marginal_effects_plot,
-    model_comparison, did_trends, style
-)
-from econometrics_lab.fuzzy import fuzzy_index, topsis
-from econometrics_lab.exporting import models_excel, docx_report, pdf_report
-from econometrics_lab.codegen import generate_code
-from econometrics_lab.interpretation import interpret_model
-from econometrics_lab.ui_v2 import (
-    inject_css, hero, dataset_fingerprint, recommend_models, model_header,
-    comparison_table, assistant_recommendation, candidate_panel_pairs
-)
-from econometrics_lab.publication import apply_publication_style, figure_bytes, figure_html
-from econometrics_lab.research_v2 import health_check, robustness_ols, event_study
+from scipy import stats
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.stats.diagnostic import het_breuschpagan, het_white, linear_reset
+from statsmodels.stats.stattools import jarque_bera, durbin_watson
 
-APP_DIR=Path(__file__).parent
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
 st.set_page_config(
-    page_title="Econometrics Lab",
-    page_icon="📊",
+    page_title="Econometría Interactiva · UVigo",
+    page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
-inject_css()
 
-NAV=[
-    "🏠 Workspace",
-    "📁 Data",
-    "📊 Explore",
-    "🧮 Model Studio",
-    "🧪 Research Lab",
-    "🎮 Simulator",
-    "📑 Report",
-]
+def check_app_password():
+    """
+    Contraseña general de acceso a la app.
+    Se configura en Streamlit Secrets:
 
-DEFAULTS={
-    "df":None,"source_name":None,"column_map":{},"models":[],
-    "current_model":None,"nav":"🏠 Workspace",
-    "pub_style":"Minimal","pub_size":"Double column",
-}
-for k,v in DEFAULTS.items():
-    if k not in st.session_state:
-        st.session_state[k]=v
+    [access]
+    password = "Econometria2026"
+    """
+    if st.session_state.get("app_authenticated", False):
+        return True
 
-def go_to(page_name):
-    st.session_state["nav"] = page_name
-
-def set_df(df,name="dataset",mapping=None):
-    st.session_state.df=df
-    st.session_state.source_name=name
-    st.session_state.column_map=mapping or {}
-    st.session_state.current_model=None
-
-def need_data():
-    if st.session_state.df is None:
-        st.warning("Load a dataset first in **Data**.")
-        st.button("Go to Data", on_click=go_to, args=("📁 Data",))
-        st.stop()
-    return st.session_state.df
-
-def save_model(m):
-    existing=[x.name for x in st.session_state.models]
-    if m.name in existing:
-        i=existing.index(m.name)
-        st.session_state.models[i]=m
-    else:
-        st.session_state.models.append(m)
-    st.session_state.current_model=m
-    st.success(f"Model saved: **{m.name}**")
-
-def pub_fig(fig,title=None):
-    return apply_publication_style(fig,st.session_state.pub_style,st.session_state.pub_size,title)
-
-def download_figure(fig,key):
-    c1,c2,c3,c4=st.columns(4)
-    c1.download_button(
-        "HTML",figure_html(fig),file_name=f"{key}.html",mime="text/html",
-        key=f"{key}_html"
+    st.markdown(
+        """
+        <div style="
+            max-width:520px;
+            margin:8vh auto 1.5rem auto;
+            padding:1.6rem 1.8rem;
+            border:1px solid #E1E7ED;
+            border-radius:18px;
+            background:#ffffff;
+            box-shadow:0 8px 30px rgba(18,53,91,.08);
+        ">
+            <div style="
+                font-size:.82rem;
+                text-transform:uppercase;
+                letter-spacing:.08em;
+                color:#1F6E8C;
+                font-weight:700;
+                margin-bottom:.35rem;
+            ">
+                Econometría · Universidade de Vigo
+            </div>
+            <div style="
+                font-size:2rem;
+                font-weight:750;
+                color:#12355B;
+                margin-bottom:.35rem;
+            ">
+                Econometría Interactiva
+            </div>
+            <div style="color:#5E6975;">
+                Acceso restringido. Introduce la contraseña del curso para continuar.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-    for col,fmt,label in [(c2,"png","PNG"),(c3,"svg","SVG"),(c4,"pdf","PDF")]:
-        try:
-            data=figure_bytes(fig,fmt,scale=2 if fmt=="png" else 1)
-            col.download_button(label,data,file_name=f"{key}.{fmt}",
-                                mime={"png":"image/png","svg":"image/svg+xml","pdf":"application/pdf"}[fmt],
-                                key=f"{key}_{fmt}")
-        except Exception:
-            col.caption(f"{label}: available when Kaleido is active")
 
-def model_graph(model,df,chart):
-    if chart=="Coefficients":
-        return coefficient_plot(model)
-    if chart=="Actual vs predicted":
-        return actual_predicted(df,model)
-    if chart=="Residuals vs fitted":
-        return residual_fitted(model)
-    if chart=="Residual distribution":
-        return residual_hist(model)
-    if chart=="Q–Q":
-        return qq_plot(model)
-    if chart=="ROC / AUC":
-        return roc_plot(df,model)
-    if chart=="Marginal effects":
-        return marginal_effects_plot(model)
-    raise ValueError(chart)
-
-def model_graph_choices(m):
-    choices=["Coefficients"]
-    if m.fitted is not None and m.residuals is not None:
-        choices += ["Actual vs predicted","Residuals vs fitted","Residual distribution","Q–Q"]
-    if m.family in ("Logit","Probit","Cloglog"):
-        choices += ["ROC / AUC"]
-    if m.marginal_effects is not None:
-        choices += ["Marginal effects"]
-    return choices
-
-def render_health_table(model):
-    h=health_check(model)
-    for _,r in h.iterrows():
-        status=str(r["status"])
-        icon={"Good":"🟢","Warning":"🟠","High":"🔴","Check":"🔵","N/A":"⚪"}.get(status,"⚪")
-        st.markdown(f"**{icon} {r['dimension']} — {status}**  \n{r['detail']}")
-    return h
-
-def render_model_result(model,df):
-    model_header(model)
-    tabs=st.tabs(["Results","Interpretation","Diagnostics","Graphics"])
-    with tabs[0]:
-        st.dataframe(
-            model.coef_table.style.format({
-                "coef":"{:.5g}","std_err":"{:.5g}","stat":"{:.4g}",
-                "p_value":"{:.4g}","ci_low":"{:.5g}","ci_high":"{:.5g}"
-            }),
-            use_container_width=True,hide_index=True
+    with st.form("app_login_form", clear_on_submit=False):
+        entered_password = st.text_input(
+            "Contraseña",
+            type="password",
+            autocomplete="current-password",
         )
-        if model.marginal_effects is not None:
-            with st.expander("Average marginal effects"):
-                st.dataframe(model.marginal_effects,use_container_width=True,hide_index=True)
-        if getattr(model,"notes",None):
-            st.caption(" · ".join(model.notes))
-    with tabs[1]:
-        nonconst=[t for t in model.coef_table["term"].astype(str).tolist()
-                  if t.lower() not in ("intercept","const")]
-        focal=st.selectbox("Focal coefficient",nonconst or model.coef_table["term"].astype(str).tolist(),
-                           key=f"result_focal_{model.name}")
-        st.markdown(interpret_model(model,focal))
-    with tabs[2]:
-        render_health_table(model)
-        if model.family in ("OLS","Linear Probability Model"):
-            try:
-                with st.expander("Detailed test table"):
-                    st.dataframe(ols_diagnostics(model),use_container_width=True,hide_index=True)
-                with st.expander("Variance Inflation Factors"):
-                    st.dataframe(vif_table(model),use_container_width=True,hide_index=True)
-            except Exception as e:
-                st.caption(str(e))
-    with tabs[3]:
-        chart=st.selectbox("Graph",model_graph_choices(model),key=f"result_graph_{model.name}")
+        submitted = st.form_submit_button(
+            "Entrar",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
         try:
-            fig=pub_fig(model_graph(model,df,chart))
-            st.plotly_chart(fig,use_container_width=True)
-            download_figure(fig,f"{model.name}_{chart}".replace(" ","_").replace("/","_"))
-        except Exception as e:
-            st.error(str(e))
-
-# ---------- sidebar ----------
-with st.sidebar:
-    st.markdown("## ECONOMETRICS LAB")
-    st.caption("Interactive Econometric Research Environment")
-    st.radio("Navigation",NAV,key="nav",label_visibility="collapsed")
-    st.divider()
-    if st.session_state.df is not None:
-        d=st.session_state.df
-        fp=dataset_fingerprint(d)
-        st.markdown(f"**{st.session_state.source_name}**")
-        st.caption(f"{fp['rows']:,} rows · {fp['cols']} variables")
-        st.caption(f"Missing: {fp['missing_pct']:.2f}% · Models: {len(st.session_state.models)}")
-    else:
-        st.caption("No dataset loaded")
-    with st.expander("Publication graphics"):
-        st.selectbox("Style",["Minimal","Economics journal","APA","Presentation","Dark presentation"],key="pub_style")
-        st.selectbox("Size",["Single column","Double column","Presentation 16:9","Square"],key="pub_size")
-
-page=st.session_state.nav
-
-# ============================================================
-# WORKSPACE
-# ============================================================
-if page=="🏠 Workspace":
-    hero(
-        "Econometrics Lab",
-        "From raw data to econometric evidence: explore, estimate, diagnose, stress-test, simulate and export."
-    )
-    if st.session_state.df is None:
-        c1,c2=st.columns([1.35,1])
-        with c1:
-            st.markdown("### Start a new analysis")
-            st.markdown("Upload your own research data or open a synthetic project designed to test the full workflow.")
-            st.button(
-                "Open Data workspace",
-                type="primary",
-                use_container_width=True,
-                on_click=go_to,
-                args=("📁 Data",),
-            )
-        with c2:
-            st.markdown('<div class="card"><strong>Designed for research</strong><br><span class="small">Econometric models, causal workflows, diagnostics, specification robustness, fuzzy indicators, publication graphics and reproducible exports.</span></div>',unsafe_allow_html=True)
-    else:
-        df=st.session_state.df;fp=dataset_fingerprint(df)
-        c1,c2,c3,c4=st.columns(4)
-        c1.metric("Observations",f"{fp['rows']:,}")
-        c2.metric("Variables",fp["cols"])
-        c3.metric("Missingness",f"{fp['missing_pct']:.2f}%")
-        c4.metric("Saved models",len(st.session_state.models))
-        st.markdown("### Continue your analysis")
-        b1,b2,b3=st.columns(3)
-        b1.button("📊 Explore data",use_container_width=True,on_click=go_to,args=("📊 Explore",))
-        b2.button("🧮 Build a model",type="primary",use_container_width=True,on_click=go_to,args=("🧮 Model Studio",))
-        b3.button("🧪 Open Research Lab",use_container_width=True,on_click=go_to,args=("🧪 Research Lab",))
-
-        st.markdown("### Dataset intelligence")
-        st.markdown(assistant_recommendation(df))
-        if st.session_state.models:
-            st.markdown("### Recent models")
-            recent=st.session_state.models[-5:][::-1]
-            tbl=pd.DataFrame([{"Model":m.name,"Family":m.family,"Formula":m.formula,"Created":m.created} for m in recent])
-            st.dataframe(tbl,use_container_width=True,hide_index=True)
-
-# ============================================================
-# DATA
-# ============================================================
-elif page=="📁 Data":
-    hero("Data","Import, inspect, clean and transform your research dataset.","Data workspace")
-    tabs=st.tabs(["Import","Profile","Missing data","Transform","Filter"])
-    with tabs[0]:
-        c1,c2=st.columns(2)
-        with c1:
-            st.markdown("### Upload data")
-            up=st.file_uploader("CSV, Excel, Stata, SPSS or Parquet",
-                                type=["csv","xlsx","xls","dta","sav","parquet"])
-            if up is not None:
-                try:
-                    df,mapping=load_bytes(up.getvalue(),up.name)
-                    set_df(df,up.name,mapping)
-                    st.success(f"Loaded {len(df):,} observations and {df.shape[1]} variables.")
-                    if any(k!=v for k,v in mapping.items()):
-                        with st.expander("Renamed variables"):
-                            st.dataframe(pd.DataFrame({"original":mapping.keys(),"econometric_name":mapping.values()}),
-                                         use_container_width=True,hide_index=True)
-                except Exception as e:
-                    st.exception(e)
-        with c2:
-            st.markdown("### Demo projects")
-            demo=st.selectbox("Dataset",["Panel / causal research demo","Time-series research demo"])
-            st.caption("The panel demo supports OLS, binary/count models, FE/RE, IV and DiD.")
-            if st.button("Load demo project",type="primary",use_container_width=True):
-                fn="panel_causal_demo.csv" if demo.startswith("Panel") else "time_series_demo.csv"
-                df=pd.read_csv(APP_DIR/"data"/fn)
-                set_df(df,fn,{c:c for c in df.columns})
-                st.rerun()
-    with tabs[1]:
-        df=need_data();fp=dataset_fingerprint(df)
-        c1,c2,c3,c4=st.columns(4)
-        c1.metric("Rows",f"{fp['rows']:,}");c2.metric("Columns",fp["cols"])
-        c3.metric("Numeric",fp["numeric"]);c4.metric("Duplicates",f"{fp['duplicates']:,}")
-        st.dataframe(df.head(250),use_container_width=True)
-        st.markdown("### Variable profile")
-        st.dataframe(dataframe_profile(df),use_container_width=True,hide_index=True)
-        st.download_button("Download current dataset",df.to_csv(index=False).encode(),
-                           file_name="econometrics_lab_data.csv",mime="text/csv")
-    with tabs[2]:
-        df=need_data()
-        st.dataframe(missing_summary(df),use_container_width=True,hide_index=True)
-        c1,c2=st.columns([1,2])
-        mode=c1.selectbox("Treatment",["Drop rows","Mean","Median","Mode","Forward fill","Backward fill"])
-        cols=c2.multiselect("Variables",df.columns.tolist(),default=df.columns.tolist())
-        if st.button("Apply missing-data treatment"):
-            set_df(handle_missing(df,mode,cols),st.session_state.source_name,st.session_state.column_map)
-            st.success("Treatment applied.")
-    with tabs[3]:
-        df=need_data();nums=numeric_columns(df)
-        c1,c2=st.columns(2)
-        op=c1.selectbox("Transformation",["Log","Log(1+x)","Square","Standardize","Difference","Lag","Winsorize","Interaction","Dummy threshold"])
-        cols=c2.multiselect("Variable(s)",nums)
-        new=st.text_input("New variable name (optional)")
-        val=None
-        if op=="Lag": val=st.number_input("Lag",1,50,1)
-        elif op=="Winsorize": val=st.number_input("Tail proportion",.001,.20,.01,.001)
-        elif op=="Dummy threshold": val=st.number_input("Threshold",value=0.0)
-        if st.button("Create transformation",type="primary"):
-            try:
-                set_df(apply_transform(df,op,cols,new or None,val),st.session_state.source_name,st.session_state.column_map)
-                st.success("Transformation created.")
-            except Exception as e: st.exception(e)
-    with tabs[4]:
-        df=need_data()
-        st.caption("Pandas query syntax, e.g. `age >= 30 and immigrant == 1`.")
-        q=st.text_input("Filter expression")
-        if st.button("Apply filter") and q:
-            try:
-                set_df(df.query(q),st.session_state.source_name,st.session_state.column_map)
-                st.success("Filter applied.")
-            except Exception as e: st.exception(e)
-
-# ============================================================
-# EXPLORE
-# ============================================================
-elif page=="📊 Explore":
-    df=need_data();nums=numeric_columns(df)
-    hero("Explore","Understand distributions, relationships, groups, dependence and data quality before modelling.","Visual analytics")
-    tabs=st.tabs(["Distributions","Relationships","Groups","Correlation","Time / Panel","Data quality","Publication"])
-    with tabs[0]:
-        c1,c2,c3=st.columns(3)
-        kind=c1.selectbox("Chart",["Histogram","Box","Violin"])
-        y=c2.selectbox("Variable",nums)
-        group=c3.selectbox("Group / colour",["None"]+df.columns.tolist())
-        group=None if group=="None" else group
-        if kind=="Histogram":
-            bins=st.slider("Bins",5,100,30)
-            fig=histogram(df,y,group,bins)
-        else:
-            x=st.selectbox("X category",["None"]+df.columns.tolist())
-            x=None if x=="None" else x
-            fig=box_violin(df,y,x,group,kind)
-        fig=pub_fig(fig);st.plotly_chart(fig,use_container_width=True);download_figure(fig,"distribution")
-    with tabs[1]:
-        if len(nums)<2:
-            st.info("At least two numeric variables are required.")
-        else:
-            c1,c2,c3=st.columns(3)
-            x=c1.selectbox("X",nums,key="ex_rel_x")
-            y=c2.selectbox("Y",nums,index=min(1,len(nums)-1),key="ex_rel_y")
-            trend=c3.selectbox("Trend",["None","OLS","LOWESS"])
-            color=st.selectbox("Colour",["None"]+df.columns.tolist(),key="ex_rel_c")
-            color=None if color=="None" else color
-            fig=scatter(df,x,y,color,None,None if trend=="None" else trend)
-            fig=pub_fig(fig);st.plotly_chart(fig,use_container_width=True);download_figure(fig,"relationship")
-    with tabs[2]:
-        c1,c2=st.columns(2)
-        y=c1.selectbox("Outcome",nums,key="ex_grp_y")
-        grp=c2.selectbox("Grouping variable",df.columns.tolist(),key="ex_grp_x")
-        fig=pub_fig(group_means(df,y,grp));st.plotly_chart(fig,use_container_width=True);download_figure(fig,"group_means")
-    with tabs[3]:
-        variables=st.multiselect("Variables",nums,default=nums[:min(8,len(nums))])
-        method=st.radio("Method",["pearson","spearman","kendall"],horizontal=True)
-        if len(variables)>=2:
-            fig=pub_fig(correlation_heatmap(df,variables,method))
-            st.plotly_chart(fig,use_container_width=True);download_figure(fig,"correlation")
-            if len(variables)<=8 and st.checkbox("Show scatter matrix"):
-                sm=pub_fig(scatter_matrix(df,variables));st.plotly_chart(sm,use_container_width=True)
-    with tabs[4]:
-        c1,c2,c3=st.columns(3)
-        tx=c1.selectbox("Time/index",df.columns.tolist(),key="ex_time_x")
-        ty=c2.selectbox("Outcome",nums,key="ex_time_y")
-        tg=c3.selectbox("Panel/group",["None"]+df.columns.tolist(),key="ex_time_g")
-        tg=None if tg=="None" else tg
-        fig=pub_fig(line_plot(df,tx,ty,tg))
-        st.plotly_chart(fig,use_container_width=True);download_figure(fig,"time_panel")
-    with tabs[5]:
-        fp=dataset_fingerprint(df)
-        c1,c2,c3=st.columns(3)
-        c1.metric("Average missing",f"{fp['missing_pct']:.2f}%")
-        c2.metric("Duplicated rows",fp["duplicates"])
-        c3.metric("Binary variables",len(fp["binary"]))
-        fig=pub_fig(missingness(df))
-        st.plotly_chart(fig,use_container_width=True)
-        st.dataframe(missing_summary(df),use_container_width=True,hide_index=True)
-    with tabs[6]:
-        st.markdown("### Publication mode")
-        st.markdown(f"**Current style:** {st.session_state.pub_style}  \n**Current size:** {st.session_state.pub_size}")
-        st.info("Change publication style and dimensions from the sidebar. Every Explore and model graph inherits those settings.")
-        st.markdown("""
-**Export formats:** interactive HTML plus PNG, SVG and PDF when Kaleido is available.  
-**Suggested use:** Single column for journals, Double column for wide figures, Presentation 16:9 for talks.
-""")
-
-# ============================================================
-# MODEL STUDIO
-# ============================================================
-elif page=="🧮 Model Studio":
-    df=need_data();nums=numeric_columns(df)
-    hero("Model Studio","Specify, estimate and inspect econometric models without leaving the workflow.","Unified model builder")
-
-    mode=st.segmented_control("Model family",["Cross-sectional","Panel","Causal","Time series"],default="Cross-sectional")
-    estimated=None
-
-    if mode=="Cross-sectional":
-        c1,c2=st.columns([1,1])
-        y=c1.selectbox("Dependent variable",df.columns.tolist(),key="ms_y")
-        family=c2.selectbox("Estimator",[
-            "OLS","WLS","Linear Probability Model","Logit","Probit","Cloglog",
-            "Poisson","Negative Binomial","Zero-Inflated Poisson",
-            "Ordered Logit","Ordered Probit","Quantile Regression"
-        ],key="ms_family")
-        rec=recommend_models(df,y)
-        if rec:
-            st.caption("Suggested from outcome structure: " + " · ".join([r[0] for r in rec[:3]]))
-        x=st.multiselect("Explanatory variables",[c for c in df.columns if c!=y],key="ms_x")
-        cats=[];interactions=[];cov="Classical";cluster=None;weights=None;q=.5
-        if family not in ("Ordered Logit","Ordered Probit","Zero-Inflated Poisson","Quantile Regression"):
-            cats=st.multiselect("Treat as categorical",[c for c in x if df[c].nunique(dropna=True)<30],key="ms_cats")
-            with st.expander("Interactions and covariance"):
-                a=st.selectbox("Interaction A",["None"]+x,key="ms_ia")
-                b=st.selectbox("Interaction B",["None"]+x,key="ms_ib")
-                if a!="None" and b!="None" and a!=b: interactions=[(a,b)]
-                cov=st.selectbox("Standard errors",["Classical","HC0","HC1","HC2","HC3","Cluster"],
-                                 index=4 if family in ("OLS","WLS","Linear Probability Model") else 0,key="ms_cov")
-                if cov=="Cluster":
-                    cluster=st.selectbox("Cluster variable",df.columns.tolist(),key="ms_cluster")
-                if family=="WLS":
-                    weights=st.selectbox("Weight variable",[c for c in nums if c!=y],key="ms_weights")
-        if family=="Quantile Regression":
-            q=st.slider("Quantile",.05,.95,.50,.05,key="ms_q")
-        name=st.text_input("Model name",value=f"{family} — {y}",key="ms_name")
-        try:
-            preview_family="OLS" if family=="Linear Probability Model" else family
-            if x:
-                preview=build_formula(y,x,cats,interactions)
-                st.markdown(f'<div class="formula">{preview}</div>',unsafe_allow_html=True)
+            configured_password = str(st.secrets["access"]["password"])
         except Exception:
-            pass
-        if st.button("RUN MODEL",type="primary",use_container_width=True,disabled=not bool(x)):
-            try:
-                if family=="Zero-Inflated Poisson":
-                    estimated=fit_zero_inflated_poisson(df,name,y,x)
-                elif family in ("Ordered Logit","Ordered Probit"):
-                    estimated=fit_ordered(df,name,y,x,"logit" if family.endswith("Logit") else "probit")
-                else:
-                    engine_family="OLS" if family=="Linear Probability Model" else family
-                    estimated=fit_cross_section(df,name,engine_family,y,x,cats,interactions,cov,q,weights,cluster)
-                    if family=="Linear Probability Model":
-                        estimated.family="Linear Probability Model"
-                save_model(estimated)
-            except Exception as e:
-                st.exception(e)
+            st.error(
+                "La contraseña general todavía no está configurada. "
+                "Añade `[access] password = \"Econometria2026\"` "
+                "en Streamlit Secrets."
+            )
+            return False
 
-    elif mode=="Panel":
-        ids,times=candidate_panel_pairs(df)
-        c1,c2,c3=st.columns(3)
-        entity=c1.selectbox("Entity ID",df.columns.tolist(),index=df.columns.get_loc(ids[0]) if ids and ids[0] in df.columns else 0)
-        time=c2.selectbox("Time",df.columns.tolist(),index=df.columns.get_loc(times[0]) if times and times[0] in df.columns else min(1,len(df.columns)-1))
-        family=c3.selectbox("Estimator",["Fixed Effects","Random Effects","Pooled OLS","First Differences"])
-        y=st.selectbox("Dependent variable",nums,key="panel_y")
-        x=st.multiselect("Regressors",[c for c in nums if c!=y],key="panel_x")
-        c1,c2=st.columns(2)
-        time_fe=c1.checkbox("Time fixed effects",value=True,disabled=family!="Fixed Effects")
-        cov=c2.selectbox("Covariance",["robust","clustered","unadjusted"])
-        name=st.text_input("Model name",f"{family} — {y}",key="panel_name")
-        if st.button("RUN PANEL MODEL",type="primary",use_container_width=True,disabled=not bool(x)):
-            try:
-                estimated=fit_panel(df,name,family,y,x,entity,time,time_fe,cov);save_model(estimated)
-            except Exception as e: st.exception(e)
-
-    elif mode=="Causal":
-        causal=st.segmented_control("Design",["IV / 2SLS","Difference-in-Differences"],default="IV / 2SLS")
-        if causal=="IV / 2SLS":
-            y=st.selectbox("Outcome",nums,key="iv_y")
-            endog=st.multiselect("Endogenous regressor(s)",[c for c in nums if c!=y],key="iv_endog")
-            inst=st.multiselect("Instrument(s)",[c for c in nums if c!=y and c not in endog],key="iv_inst")
-            exog=st.multiselect("Exogenous controls",[c for c in nums if c!=y and c not in endog and c not in inst],key="iv_exog")
-            name=st.text_input("Model name",f"2SLS — {y}",key="iv_name")
-            if st.button("RUN 2SLS",type="primary",use_container_width=True,disabled=not(endog and inst)):
-                try:
-                    estimated=fit_iv(df,name,y,exog,endog,inst);save_model(estimated)
-                except Exception as e: st.exception(e)
+        if hmac.compare_digest(entered_password, configured_password):
+            st.session_state["app_authenticated"] = True
+            st.rerun()
         else:
-            y=st.selectbox("Outcome",nums,key="did_y")
-            c1,c2=st.columns(2)
-            treat=c1.selectbox("Treatment indicator",nums,key="did_t")
-            post=c2.selectbox("Post indicator",nums,key="did_p")
-            controls=st.multiselect("Controls",[c for c in nums if c not in [y,treat,post]],key="did_c")
-            add_fe=st.checkbox("Unit and time fixed effects")
-            c1,c2=st.columns(2)
-            unit=c1.selectbox("Unit",["None"]+df.columns.tolist(),key="did_unit");unit=None if unit=="None" else unit
-            time=c2.selectbox("Time",["None"]+df.columns.tolist(),key="did_time");time=None if time=="None" else time
-            cov=st.selectbox("Inference",["HC3","HC2","HC1","HC0","Cluster unit"],key="did_cov")
-            name=st.text_input("Model name",f"DiD — {y}",key="did_name")
-            if st.button("RUN DiD",type="primary",use_container_width=True):
+            st.error("Contraseña incorrecta.")
+
+    return False
+
+
+def logout_app():
+    st.session_state["app_authenticated"] = False
+
+
+if not check_app_password():
+    st.stop()
+
+st.markdown("""
+<style>
+.block-container {
+    padding-top: 1.4rem;
+    padding-bottom: 3rem;
+    max-width: 1250px;
+}
+[data-testid="stSidebar"] {
+    border-right: 1px solid #E5EAF0;
+}
+.hero {
+    padding: 1.4rem 1.6rem;
+    border-radius: 18px;
+    background: linear-gradient(135deg, #12355B 0%, #1F6E8C 100%);
+    color: white;
+    margin-bottom: 1rem;
+}
+.hero h1 {
+    color: white;
+    margin: 0;
+    font-size: 2.2rem;
+}
+.hero p {
+    margin: .5rem 0 0 0;
+    opacity: .94;
+}
+.card {
+    border: 1px solid #E1E7ED;
+    border-radius: 14px;
+    padding: 1rem 1.1rem;
+    background: white;
+    min-height: 140px;
+}
+.kicker {
+    font-size: .82rem;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    opacity: .85;
+}
+.small {
+    font-size: .9rem;
+    color: #5E6975;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# CARGA DE DATOS DEL ALUMNO
+# ============================================================
+
+def load_uploaded_dataset(uploaded_file):
+    """Lee una base CSV o XLSX subida por el usuario."""
+    if uploaded_file is None:
+        return None
+
+    filename = uploaded_file.name.lower()
+
+    if filename.endswith(".csv"):
+        # Intento estándar; si el separador es ;, pandas lo detecta con engine=python.
+        try:
+            return pd.read_csv(uploaded_file)
+        except Exception:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, sep=None, engine="python")
+
+    if filename.endswith(".xlsx"):
+        return pd.read_excel(uploaded_file, engine="openpyxl")
+
+    raise ValueError("Formato no compatible. Utiliza CSV o XLSX.")
+
+
+def require_uploaded_dataset(key, label="Sube la base de datos"):
+    """
+    Obliga a subir una base antes de utilizar un laboratorio.
+    No existe ningún dataset demo o automático.
+    """
+    uploaded = st.file_uploader(
+        label,
+        type=["csv", "xlsx"],
+        key=key,
+        help="La base se utiliza únicamente durante esta sesión de la aplicación.",
+    )
+
+    if uploaded is None:
+        st.info(
+            "⬆️ Sube una base de datos en formato CSV o XLSX para continuar."
+        )
+        st.stop()
+
+    try:
+        df = load_uploaded_dataset(uploaded)
+    except Exception as exc:
+        st.error("No se pudo leer la base de datos.")
+        st.code(str(exc), language="text")
+        st.stop()
+
+    if df is None or df.empty:
+        st.error("La base está vacía.")
+        st.stop()
+
+    return df, uploaded.name
+
+
+def numeric_columns(df):
+    return df.select_dtypes(include=np.number).columns.tolist()
+
+
+def fit_ols(df, y, xs, robust=False):
+    dat = (
+        df[[y] + list(xs)]
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .copy()
+    )
+    X = sm.add_constant(dat[list(xs)], has_constant="add")
+    model = sm.OLS(dat[y], X).fit()
+
+    if robust:
+        model = model.get_robustcov_results(cov_type="HC1")
+
+    return model, dat
+
+
+def coef_table(model):
+    names = list(model.model.exog_names)
+    conf = np.asarray(model.conf_int())
+
+    return pd.DataFrame({
+        "Variable": names,
+        "Coeficiente": np.asarray(model.params),
+        "Error típico": np.asarray(model.bse),
+        "t": np.asarray(model.tvalues),
+        "p-valor": np.asarray(model.pvalues),
+        "IC 95% inf.": conf[:, 0],
+        "IC 95% sup.": conf[:, 1],
+    })
+
+
+def equation_text(model, y):
+    names = list(model.model.exog_names)
+    params = np.asarray(model.params)
+
+    pieces = []
+    for name, b in zip(names, params):
+        if name == "const":
+            pieces.append(f"{b:.3f}")
+        else:
+            sign = "+" if b >= 0 else "-"
+            pieces.append(f" {sign} {abs(b):.3f}·{name}")
+
+    return f"{y} = " + "".join(pieces)
+
+
+def gretl_script(y, xs, filename="datos.csv"):
+    regressors = " ".join(xs)
+    return f"""# ECONOMETRÍA · SCRIPT BASE GRETl
+
+open {filename}
+
+# 1. Descriptivos
+summary {y} {regressors}
+corr {y} {regressors}
+
+# 2. Estimación por MCO
+ols {y} const {regressors}
+
+# 3. Diagnóstico
+vif
+modtest --normality
+modtest --squares
+modtest --white
+
+# 4. Guarda el script para reproducibilidad
+"""
+
+
+# ============================================================
+# BANCO DE PREGUNTAS Y ENVÍO DE TEST
+# ============================================================
+
+BANK_FILENAME = "Banco_preguntas_MooVi_Econometria.xlsx"
+TEACHER_EMAIL = "alessandro.indelicato.examen@gmail.com"
+
+FICHA_LABELS = {
+    "Ficha00": "Ficha00 · Introducción a Gretl y entorno de trabajo",
+    "Ficha01": "Ficha01 · Datos, gráficos, estadística y álgebra en Gretl",
+    "Ficha02": "Ficha02 · Regresión lineal y estimación por MCO",
+    "Ficha03": "Ficha03 · Propiedades MCO, especificación y cambios de escala",
+    "Ficha04": "Ficha04 · Inferencia, contrastes e intervalos de confianza",
+    "Ficha05": "Ficha05 · Multicolinealidad y especificación",
+    "Ficha06": "Ficha06 · Diagnóstico general del modelo econométrico",
+}
+
+LABEL_TO_FICHA = {v: k for k, v in FICHA_LABELS.items()}
+
+
+def _safe_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+@st.cache_data(show_spinner=False)
+def load_question_bank():
+    """Carga las 1.750 preguntas desde la hoja 'Todas' del banco Excel."""
+    bank_path = Path(__file__).resolve().parent / BANK_FILENAME
+
+    if not bank_path.exists():
+        raise FileNotFoundError(
+            f"No se encuentra `{BANK_FILENAME}` en la raíz del repositorio."
+        )
+
+    try:
+        df_bank = pd.read_excel(
+            bank_path,
+            sheet_name="Todas",
+            engine="openpyxl",
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "No se pudo abrir el banco de preguntas. "
+            "Comprueba que el Excel contiene una hoja llamada `Todas`."
+        ) from exc
+
+    required = [
+        "ID",
+        "Ficha",
+        "Tema",
+        "Pregunta",
+        "Opción A",
+        "Opción B",
+        "Opción C",
+        "Opción D",
+        "Correcta",
+        "Respuesta correcta",
+    ]
+
+    missing = [c for c in required if c not in df_bank.columns]
+
+    if missing:
+        raise ValueError(
+            "Faltan columnas en el banco: " + ", ".join(missing)
+        )
+
+    option_columns = {
+        "A": "Opción A",
+        "B": "Opción B",
+        "C": "Opción C",
+        "D": "Opción D",
+    }
+
+    bank = []
+
+    for _, row in df_bank.iterrows():
+        qid = _safe_text(row["ID"])
+        ficha = _safe_text(row["Ficha"])
+        tema = _safe_text(row["Tema"])
+        question_text = _safe_text(row["Pregunta"])
+        correct_letter = _safe_text(row["Correcta"]).upper()
+
+        option_by_letter = {
+            letter: _safe_text(row[column])
+            for letter, column in option_columns.items()
+        }
+
+        options = [
+            value for value in option_by_letter.values()
+            if value
+        ]
+
+        correct_answer = _safe_text(row["Respuesta correcta"])
+
+        if not correct_answer:
+            correct_answer = option_by_letter.get(correct_letter, "")
+
+        explanation = (
+            _safe_text(row["Explicación"])
+            if "Explicación" in df_bank.columns
+            else ""
+        )
+
+        if (
+            qid
+            and ficha
+            and question_text
+            and len(options) >= 2
+            and correct_answer
+        ):
+            bank.append({
+                "id": qid,
+                "ficha": ficha,
+                "tema": tema,
+                "dificultad": "",
+                "pregunta": question_text,
+                "opciones": options,
+                "correcta": correct_answer,
+                "explicacion": explanation,
+            })
+
+    if not bank:
+        raise ValueError(
+            "El Excel se abrió correctamente, pero no contiene preguntas válidas."
+        )
+
+    return bank
+
+def build_submission_csv(student, exam_id, attempt_id, selected_labels, questions, responses, score):
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=";")
+
+    writer.writerow(["ECONOMETRÍA · MINI-TEST"])
+    writer.writerow(["ID convocatoria", exam_id])
+    writer.writerow(["ID intento", attempt_id])
+    writer.writerow(["Fecha/hora", datetime.now().astimezone().isoformat(timespec="seconds")])
+    writer.writerow(["Nombre y apellidos", student["name"]])
+    writer.writerow(["DNI", student["dni"]])
+    writer.writerow(["NIE", student["nie"]])
+    writer.writerow(["Correo UVigo", student["email"]])
+    writer.writerow(["Grupo", student["group"]])
+    writer.writerow(["Temario", " | ".join(selected_labels)])
+    writer.writerow(["Número de preguntas", len(questions)])
+    writer.writerow(["Aciertos", score])
+    writer.writerow(["Nota sobre 10", round(score / len(questions) * 10, 2)])
+    writer.writerow([])
+
+    writer.writerow([
+        "N",
+        "ID pregunta",
+        "Ficha",
+        "Tema",
+        "Dificultad",
+        "Pregunta",
+        "Respuesta estudiante",
+        "Respuesta correcta",
+        "Correcta",
+    ])
+
+    for i, (q, response) in enumerate(zip(questions, responses), start=1):
+        writer.writerow([
+            i,
+            q["id"],
+            q["ficha"],
+            q["tema"],
+            q["dificultad"],
+            q["pregunta"],
+            response or "",
+            q["correcta"],
+            "Sí" if response == q["correcta"] else "No",
+        ])
+
+    return output.getvalue().encode("utf-8-sig")
+
+
+def send_submission_email(csv_bytes, student, exam_id, attempt_id, score, n_questions):
+    try:
+        email_cfg = st.secrets["email"]
+        sender = email_cfg["sender"]
+        app_password = email_cfg["app_password"]
+    except Exception as exc:
+        raise RuntimeError(
+            "El envío de correo todavía no está configurado en Streamlit Secrets."
+        ) from exc
+
+    safe_name = re.sub(r"[^A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_-]+", "_", student["name"]).strip("_")
+    filename = f"econometria_test_{safe_name}_{attempt_id[:8]}.csv"
+
+    msg = EmailMessage()
+    msg["Subject"] = (
+        f"Econometría · Mini-test · {student['name']} · "
+        f"{score}/{n_questions}"
+    )
+    msg["From"] = sender
+    msg["To"] = TEACHER_EMAIL
+
+    msg.set_content(
+        "Se ha recibido un nuevo mini-test de Econometría.\n\n"
+        f"Estudiante: {student['name']}\n"
+        f"DNI: {student['dni']}\n"
+        f"NIE: {student['nie']}\n"
+        f"Correo UVigo: {student['email']}\n"
+        f"Grupo: {student['group'] or 'No indicado'}\n"
+        f"Resultado docente: {score}/{n_questions}\n"
+        f"ID convocatoria: {exam_id}\n"
+        f"ID de intento: {attempt_id}\n\n"
+        "El CSV adjunto contiene las preguntas, respuestas del estudiante "
+        "y la corrección completa."
+    )
+
+    msg.add_attachment(
+        csv_bytes,
+        maintype="text",
+        subtype="csv",
+        filename=filename,
+    )
+
+    context = ssl.create_default_context()
+
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com",
+        465,
+        context=context,
+        timeout=20,
+    ) as smtp:
+        smtp.login(sender, app_password)
+        smtp.send_message(msg)
+
+
+def reset_quiz_state():
+    for key in [
+        "quiz_questions",
+        "quiz_attempt_id",
+        "quiz_exam_id",
+        "quiz_participant_key",
+        "quiz_selected_labels",
+        "quiz_selected_topics",
+        "quiz_submitted",
+    ]:
+        st.session_state.pop(key, None)
+
+
+
+
+# ============================================================
+# CONTROL DEL MODO EXAMEN
+# ============================================================
+
+MADRID_TZ = ZoneInfo("Europe/Madrid")
+TEST_CONTROL_FILE = Path(tempfile.gettempdir()) / "econometria_test_control.json"
+ATTEMPT_DB_FILE = Path(tempfile.gettempdir()) / "econometria_attempts.sqlite3"
+
+
+def init_attempt_db():
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS attempts (
+                exam_id TEXT NOT NULL,
+                participant_key TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                questions_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                submitted_at TEXT,
+                PRIMARY KEY (exam_id, participant_key)
+            )
+        """)
+        conn.commit()
+
+
+
+def init_submission_db():
+    """Tabla separada para resultados ya enviados por los alumnos."""
+    init_attempt_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS submissions (
+                exam_id TEXT NOT NULL,
+                participant_key TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                student_name TEXT NOT NULL,
+                student_dni TEXT NOT NULL,
+                student_nie TEXT NOT NULL,
+                student_email TEXT NOT NULL,
+                group_name TEXT,
+                score INTEGER NOT NULL,
+                n_questions INTEGER NOT NULL,
+                submission_csv BLOB NOT NULL,
+                submitted_at TEXT NOT NULL,
+                PRIMARY KEY (exam_id, participant_key)
+            )
+        """)
+        conn.commit()
+
+
+def save_submission_for_batch(
+    exam_id,
+    participant_key,
+    attempt_id,
+    student,
+    score,
+    n_questions,
+    csv_bytes,
+):
+    """
+    Guarda localmente el examen terminado.
+    NO envía correo al profesor en este momento.
+    """
+    init_submission_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO submissions
+            (
+                exam_id,
+                participant_key,
+                attempt_id,
+                student_name,
+                student_dni,
+                student_nie,
+                student_email,
+                group_name,
+                score,
+                n_questions,
+                submission_csv,
+                submitted_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                exam_id,
+                participant_key,
+                attempt_id,
+                student["name"],
+                student["dni"],
+                student["nie"],
+                student["email"],
+                student.get("group", ""),
+                int(score),
+                int(n_questions),
+                sqlite3.Binary(csv_bytes),
+                datetime.now(MADRID_TZ).isoformat(),
+            ),
+        )
+
+        conn.execute(
+            """
+            UPDATE attempts
+            SET status = 'submitted',
+                submitted_at = ?
+            WHERE exam_id = ? AND participant_key = ?
+            """,
+            (
+                datetime.now(MADRID_TZ).isoformat(),
+                exam_id,
+                participant_key,
+            ),
+        )
+        conn.commit()
+
+
+def get_exam_submissions(exam_id):
+    init_submission_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                attempt_id,
+                student_name,
+                student_dni,
+                student_nie,
+                student_email,
+                group_name,
+                score,
+                n_questions,
+                submission_csv,
+                submitted_at
+            FROM submissions
+            WHERE exam_id = ?
+            ORDER BY student_name COLLATE NOCASE, submitted_at
+            """,
+            (exam_id,),
+        ).fetchall()
+
+    submissions = []
+    for row in rows:
+        submissions.append({
+            "attempt_id": row[0],
+            "name": row[1],
+            "dni": row[2],
+            "nie": row[3],
+            "email": row[4],
+            "group": row[5] or "",
+            "score": int(row[6]),
+            "n_questions": int(row[7]),
+            "csv_bytes": bytes(row[8]),
+            "submitted_at": row[9],
+        })
+
+    return submissions
+
+
+def safe_filename(value):
+    cleaned = re.sub(
+        r"[^A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_-]+",
+        "_",
+        str(value),
+    ).strip("_")
+    return cleaned or "estudiante"
+
+
+def build_batch_results_zip(exam_id):
+    """
+    Devuelve un ZIP con:
+    - 00_resumen.csv
+    - un CSV detallado por estudiante
+    """
+    submissions = get_exam_submissions(exam_id)
+
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(
+        buffer,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as zf:
+        summary_io = io.StringIO()
+        writer = csv.writer(summary_io, delimiter=";")
+
+        writer.writerow([
+            "Convocatoria",
+            "Nombre y apellidos",
+            "DNI",
+            "NIE",
+            "Correo UVigo",
+            "Grupo",
+            "Aciertos",
+            "Preguntas",
+            "Nota sobre 10",
+            "Fecha/hora envío",
+            "ID intento",
+        ])
+
+        for sub in submissions:
+            note = (
+                round(
+                    sub["score"] / sub["n_questions"] * 10,
+                    2,
+                )
+                if sub["n_questions"]
+                else 0
+            )
+
+            writer.writerow([
+                exam_id,
+                sub["name"],
+                sub["dni"],
+                sub["nie"],
+                sub["email"],
+                sub["group"],
+                sub["score"],
+                sub["n_questions"],
+                note,
+                sub["submitted_at"],
+                sub["attempt_id"],
+            ])
+
+        zf.writestr(
+            "00_resumen.csv",
+            summary_io.getvalue().encode("utf-8-sig"),
+        )
+
+        for i, sub in enumerate(submissions, start=1):
+            filename = (
+                f"{i:03d}_"
+                f"{safe_filename(sub['name'])}_"
+                f"{sub['attempt_id'][:8]}.csv"
+            )
+            zf.writestr(
+                filename,
+                sub["csv_bytes"],
+            )
+
+    return buffer.getvalue(), submissions
+
+
+def send_batch_results_email(exam_id):
+    """
+    Envía UN solo correo con todos los exámenes de la convocatoria.
+    """
+    zip_bytes, submissions = build_batch_results_zip(exam_id)
+
+    try:
+        email_cfg = st.secrets["email"]
+        sender = email_cfg["sender"]
+        app_password = email_cfg["app_password"]
+    except Exception as exc:
+        raise RuntimeError(
+            "El envío de correo no está configurado correctamente "
+            "en Streamlit Secrets."
+        ) from exc
+
+    msg = EmailMessage()
+    msg["Subject"] = (
+        f"Econometría · Resultados convocatoria "
+        f"{exam_id[:8]} · {len(submissions)} estudiantes"
+    )
+    msg["From"] = sender
+    msg["To"] = TEACHER_EMAIL
+
+    if submissions:
+        mean_score = sum(
+            s["score"] / s["n_questions"] * 10
+            for s in submissions
+            if s["n_questions"]
+        ) / len(submissions)
+
+        body = (
+            "Se ha cerrado una convocatoria del Mini-test de Econometría.\n\n"
+            f"ID convocatoria: {exam_id}\n"
+            f"Exámenes recibidos: {len(submissions)}\n"
+            f"Nota media: {mean_score:.2f}/10\n\n"
+            "El ZIP adjunto contiene:\n"
+            "- 00_resumen.csv con todos los estudiantes y sus resultados.\n"
+            "- un CSV detallado por estudiante con preguntas, respuestas "
+            "y corrección.\n"
+        )
+    else:
+        body = (
+            "Se ha cerrado una convocatoria del Mini-test de Econometría.\n\n"
+            f"ID convocatoria: {exam_id}\n"
+            "No se registraron exámenes enviados en esta convocatoria.\n"
+        )
+
+    msg.set_content(body)
+
+    msg.add_attachment(
+        zip_bytes,
+        maintype="application",
+        subtype="zip",
+        filename=f"resultados_econometria_{exam_id[:8]}.zip",
+    )
+
+    context = ssl.create_default_context()
+
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com",
+        465,
+        context=context,
+        timeout=30,
+    ) as smtp:
+        smtp.login(sender, app_password)
+        smtp.send_message(msg)
+
+    return len(submissions)
+
+
+def normalize_identifier(value):
+    return re.sub(r"[^A-Z0-9]", "", str(value).upper())
+
+
+def make_participant_key(dni, nie):
+    """
+    El registro compartido no guarda DNI/NIE en claro.
+    Se usa únicamente un hash de ambos identificadores.
+    """
+    raw = (
+        normalize_identifier(dni)
+        + "|"
+        + normalize_identifier(nie)
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_saved_attempt(exam_id, participant_key):
+    init_attempt_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        row = conn.execute(
+            """
+            SELECT attempt_id, status, questions_json
+            FROM attempts
+            WHERE exam_id = ? AND participant_key = ?
+            """,
+            (exam_id, participant_key),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "attempt_id": row[0],
+        "status": row[1],
+        "questions": json.loads(row[2]),
+    }
+
+
+def register_attempt(exam_id, participant_key, attempt_id, questions):
+    """
+    INSERT OR IGNORE garantiza un único intento incluso si dos pestañas
+    intentan iniciarlo casi al mismo tiempo.
+    """
+    init_attempt_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO attempts
+            (
+                exam_id,
+                participant_key,
+                attempt_id,
+                status,
+                questions_json,
+                created_at
+            )
+            VALUES (?, ?, ?, 'started', ?, ?)
+            """,
+            (
+                exam_id,
+                participant_key,
+                attempt_id,
+                json.dumps(questions, ensure_ascii=False),
+                datetime.now(MADRID_TZ).isoformat(),
+            ),
+        )
+        conn.commit()
+
+    return get_saved_attempt(exam_id, participant_key)
+
+
+def mark_attempt_submitted(exam_id, participant_key):
+    init_attempt_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        conn.execute(
+            """
+            UPDATE attempts
+            SET status = 'submitted',
+                submitted_at = ?
+            WHERE exam_id = ? AND participant_key = ?
+            """,
+            (
+                datetime.now(MADRID_TZ).isoformat(),
+                exam_id,
+                participant_key,
+            ),
+        )
+        conn.commit()
+
+
+def get_attempt_counts(exam_id):
+    if not exam_id:
+        return 0, 0
+
+    init_attempt_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        started = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM attempts
+            WHERE exam_id = ?
+            """,
+            (exam_id,),
+        ).fetchone()[0]
+
+        submitted = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM attempts
+            WHERE exam_id = ?
+              AND status = 'submitted'
+            """,
+            (exam_id,),
+        ).fetchone()[0]
+
+    return int(started), int(submitted)
+
+
+
+def default_test_control():
+    return {
+        "enabled": False,
+        "exam_id": None,
+        "start": None,
+        "end": None,
+        "selected_fichas": [],
+        "selected_topics": [],
+        "n_questions": 10,
+        "results_emailed": False,
+        "results_emailed_at": None,
+        "updated_at": None,
+    }
+
+
+def load_test_control():
+    """
+    Estado compartido entre las sesiones de la app mientras el contenedor
+    de Streamlit siga activo.
+    """
+    if not TEST_CONTROL_FILE.exists():
+        return default_test_control()
+
+    try:
+        data = json.loads(
+            TEST_CONTROL_FILE.read_text(encoding="utf-8")
+        )
+    except Exception:
+        return default_test_control()
+
+    base = default_test_control()
+    base.update(data if isinstance(data, dict) else {})
+    return base
+
+
+def save_test_control(control):
+    TEST_CONTROL_FILE.write_text(
+        json.dumps(control, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def parse_control_datetime(value):
+    if not value:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=MADRID_TZ)
+        return dt.astimezone(MADRID_TZ)
+    except Exception:
+        return None
+
+
+def get_test_gate_status():
+    """
+    Devuelve:
+      status: 'disabled', 'scheduled', 'open' o 'closed'
+      control: configuración
+      now: hora actual de Madrid
+      start/end: datetimes
+    """
+    control = load_test_control()
+    now = datetime.now(MADRID_TZ)
+    start = parse_control_datetime(control.get("start"))
+    end = parse_control_datetime(control.get("end"))
+
+    if not control.get("enabled", False):
+        status = "disabled"
+    elif start is None or end is None:
+        status = "disabled"
+    elif now < start:
+        status = "scheduled"
+    elif start <= now <= end:
+        status = "open"
+    else:
+        status = "closed"
+
+    return status, control, now, start, end
+
+
+def format_madrid_datetime(value):
+    if value is None:
+        return "—"
+    return value.strftime("%d/%m/%Y · %H:%M")
+
+
+def professor_panel():
+    st.sidebar.divider()
+
+    with st.sidebar.expander("🔐 Profesor"):
+        st.caption(
+            "Control de apertura del Mini-test. "
+            "Zona horaria: Europe/Madrid."
+        )
+
+        try:
+            configured_password = str(
+                st.secrets["admin"]["password"]
+            )
+        except Exception:
+            configured_password = ""
+
+        if not configured_password:
+            st.warning(
+                "Falta configurar `[admin] password` "
+                "en los Secrets de Streamlit."
+            )
+            return
+
+        entered = st.text_input(
+            "Contraseña",
+            type="password",
+            key="professor_password",
+        )
+
+        if entered != configured_password:
+            if entered:
+                st.error("Contraseña incorrecta.")
+            return
+
+        st.success("Acceso de profesor")
+
+        status, control, now, start, end = get_test_gate_status()
+
+        status_label = {
+            "disabled": "🔴 Desactivado",
+            "scheduled": "🟠 Programado",
+            "open": "🟢 Abierto",
+            "closed": "⚫ Finalizado",
+        }[status]
+
+        st.markdown(f"**Estado:** {status_label}")
+        st.caption(
+            f"Ahora en Madrid: {format_madrid_datetime(now)}"
+        )
+
+        # --------------------------------------------------------
+        # Configuración docente del contenido del examen
+        # --------------------------------------------------------
+        try:
+            professor_bank = load_question_bank()
+        except Exception as exc:
+            st.error("No se pudo cargar el banco de preguntas.")
+            st.code(str(exc), language="text")
+            return
+
+        current_fichas = control.get("selected_fichas") or []
+        current_labels = [
+            FICHA_LABELS[f]
+            for f in current_fichas
+            if f in FICHA_LABELS
+        ]
+
+        selected_labels_prof = st.multiselect(
+            "Ficha(s) que entran en el examen",
+            options=list(FICHA_LABELS.values()),
+            default=current_labels,
+            key="prof_exam_fichas",
+        )
+
+        selected_fichas_prof = [
+            LABEL_TO_FICHA[label]
+            for label in selected_labels_prof
+        ]
+
+        available_topics_prof = sorted({
+            q["tema"]
+            for q in professor_bank
+            if q["ficha"] in selected_fichas_prof and q["tema"]
+        })
+
+        saved_topics = [
+            topic
+            for topic in (control.get("selected_topics") or [])
+            if topic in available_topics_prof
+        ]
+
+        selected_topics_prof = st.multiselect(
+            "Tema(s) que entran",
+            options=available_topics_prof,
+            default=saved_topics,
+            help=(
+                "Si lo dejas vacío, entran todos los temas "
+                "de las fichas seleccionadas."
+            ),
+            key="prof_exam_topics",
+        )
+
+        n_questions_prof = st.slider(
+            "Número de preguntas",
+            min_value=1,
+            max_value=10,
+            value=int(control.get("n_questions") or 10),
+            key="prof_exam_n_questions",
+        )
+
+        default_start = start or now.replace(
+            second=0,
+            microsecond=0,
+        )
+        default_end = end or (
+            now.replace(second=0, microsecond=0)
+            + pd.Timedelta(minutes=60)
+        )
+
+        start_date = st.date_input(
+            "Fecha de apertura",
+            value=default_start.date(),
+            key="exam_start_date",
+        )
+
+        start_time = st.time_input(
+            "Hora de apertura",
+            value=default_start.time().replace(
+                second=0,
+                microsecond=0,
+            ),
+            step=60,
+            key="exam_start_time",
+        )
+
+        end_date = st.date_input(
+            "Fecha de cierre",
+            value=default_end.date(),
+            key="exam_end_date",
+        )
+
+        end_time = st.time_input(
+            "Hora de cierre",
+            value=default_end.time().replace(
+                second=0,
+                microsecond=0,
+            ),
+            step=60,
+            key="exam_end_time",
+        )
+
+        if st.button(
+            "💾 Programar y activar",
+            type="primary",
+            use_container_width=True,
+        ):
+            start_dt = datetime.combine(
+                start_date,
+                start_time,
+                tzinfo=MADRID_TZ,
+            )
+            end_dt = datetime.combine(
+                end_date,
+                end_time,
+                tzinfo=MADRID_TZ,
+            )
+
+            if end_dt <= start_dt:
+                st.error(
+                    "La hora de cierre debe ser posterior "
+                    "a la de apertura."
+                )
+            else:
+                if not selected_fichas_prof:
+                    st.error(
+                        "Selecciona al menos una ficha antes de activar el examen."
+                    )
+                else:
+                    new_exam_id = str(uuid.uuid4())
+
+                    save_test_control({
+                        "enabled": True,
+                        "exam_id": new_exam_id,
+                        "start": start_dt.isoformat(),
+                        "end": end_dt.isoformat(),
+                        "selected_fichas": selected_fichas_prof,
+                        "selected_topics": selected_topics_prof,
+                        "n_questions": n_questions_prof,
+                        "results_emailed": False,
+                        "results_emailed_at": None,
+                        "updated_at": datetime.now(
+                            MADRID_TZ
+                        ).isoformat(),
+                    })
+                    st.success("Mini-test programado.")
+                    st.rerun()
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            if st.button(
+                "🟢 Abrir ahora",
+                use_container_width=True,
+            ):
+                end_dt = end or (
+                    now + pd.Timedelta(minutes=60)
+                )
+
+                if end_dt <= now:
+                    end_dt = (
+                        now + pd.Timedelta(minutes=60)
+                    )
+
+                if not selected_fichas_prof:
+                    st.error(
+                        "Selecciona al menos una ficha antes de abrir el examen."
+                    )
+                else:
+                    new_exam_id = str(uuid.uuid4())
+
+                    save_test_control({
+                        "enabled": True,
+                        "exam_id": new_exam_id,
+                        "start": now.isoformat(),
+                        "end": end_dt.isoformat(),
+                        "selected_fichas": selected_fichas_prof,
+                        "selected_topics": selected_topics_prof,
+                        "n_questions": n_questions_prof,
+                        "results_emailed": False,
+                        "results_emailed_at": None,
+                        "updated_at": now.isoformat(),
+                    })
+                    st.rerun()
+
+        with c2:
+            if st.button(
+                "🔴 Cerrar y enviar resultados",
+                use_container_width=True,
+            ):
+                current_exam_id = control.get("exam_id")
+
+                # Primero cerramos la convocatoria para impedir nuevos intentos.
+                closed_control = {
+                    "enabled": False,
+                    "exam_id": current_exam_id,
+                    "start": control.get("start"),
+                    "end": control.get("end"),
+                    "selected_fichas": control.get("selected_fichas", []),
+                    "selected_topics": control.get("selected_topics", []),
+                    "n_questions": control.get("n_questions", 10),
+                    "results_emailed": False,
+                    "results_emailed_at": None,
+                    "updated_at": now.isoformat(),
+                }
+                save_test_control(closed_control)
+
                 try:
-                    estimated=fit_did(df,name,y,treat,post,controls,unit,time,add_fe,cov);save_model(estimated)
-                except Exception as e: st.exception(e)
+                    sent_count = send_batch_results_email(
+                        current_exam_id
+                    )
+                except Exception as exc:
+                    st.error(
+                        "La convocatoria se ha cerrado, pero no se pudo "
+                        "enviar el correo conjunto."
+                    )
+                    st.code(str(exc), language="text")
+                    st.warning(
+                        "Los resultados siguen guardados. "
+                        "Puedes reintentar el envío desde este panel."
+                    )
+                else:
+                    closed_control["results_emailed"] = True
+                    closed_control["results_emailed_at"] = (
+                        datetime.now(MADRID_TZ).isoformat()
+                    )
+                    save_test_control(closed_control)
+                    st.success(
+                        f"Convocatoria cerrada. Se ha enviado un único "
+                        f"correo con {sent_count} examen(es)."
+                    )
+
+                st.rerun()
+
+        if start and end:
+            st.caption(
+                "Apertura: "
+                f"{format_madrid_datetime(start)}\n\n"
+                "Cierre: "
+                f"{format_madrid_datetime(end)}"
+            )
+
+        current_exam_id = control.get("exam_id")
+        if current_exam_id:
+            attempts_started, attempts_submitted = get_attempt_counts(
+                current_exam_id
+            )
+            st.caption(
+                f"Convocatoria: {current_exam_id[:8]} · "
+                f"Intentos iniciados: {attempts_started} · "
+                f"Enviados: {attempts_submitted}"
+            )
+
+            if control.get("results_emailed", False):
+                emailed_at = parse_control_datetime(
+                    control.get("results_emailed_at")
+                )
+                st.success(
+                    "📨 Resultados conjuntos enviados"
+                    + (
+                        f" · {format_madrid_datetime(emailed_at)}"
+                        if emailed_at
+                        else ""
+                    )
+                )
+            elif not control.get("enabled", False):
+                if st.button(
+                    "📨 Reintentar envío conjunto",
+                    use_container_width=True,
+                    key="retry_batch_email",
+                ):
+                    try:
+                        sent_count = send_batch_results_email(
+                            current_exam_id
+                        )
+                    except Exception as exc:
+                        st.error(
+                            "No se pudo enviar el correo conjunto."
+                        )
+                        st.code(str(exc), language="text")
+                    else:
+                        retry_control = dict(control)
+                        retry_control["results_emailed"] = True
+                        retry_control["results_emailed_at"] = (
+                            datetime.now(MADRID_TZ).isoformat()
+                        )
+                        retry_control["updated_at"] = (
+                            datetime.now(MADRID_TZ).isoformat()
+                        )
+                        save_test_control(retry_control)
+                        st.success(
+                            f"Correo conjunto enviado con "
+                            f"{sent_count} examen(es)."
+                        )
+                        st.rerun()
+
+        configured_fichas = control.get("selected_fichas") or []
+        configured_topics = control.get("selected_topics") or []
+
+        if configured_fichas:
+            st.markdown(
+                "**Contenido activo:** "
+                + ", ".join(
+                    FICHA_LABELS.get(f, f)
+                    for f in configured_fichas
+                )
+            )
+            if configured_topics:
+                st.caption(
+                    "Temas: " + " · ".join(configured_topics)
+                )
+            else:
+                st.caption(
+                    "Temas: todos los de las fichas seleccionadas"
+                )
+            st.caption(
+                f"Preguntas por intento: {int(control.get('n_questions') or 10)}"
+            )
+
+        st.warning(
+            "La programación y los resultados se conservan mientras la instancia "
+            "de Streamlit permanezca activa. Si el cierre se produce por la hora "
+            "programada, entra después en este panel y pulsa el envío conjunto. "
+            "Si la app se reinicia completamente, vuelve a programar el examen."
+        )
+
+
+def enforce_test_gate_for_students():
+    """
+    Bloquea el Mini-test antes de cargar el banco o mostrar preguntas.
+    """
+    status, control, now, start, end = get_test_gate_status()
+
+    if status == "open":
+        st.success(
+            "🟢 Mini-test abierto. "
+            f"Cierra a las {format_madrid_datetime(end)}."
+        )
+        return True
+
+    if status == "scheduled":
+        st.info(
+            "🔒 El Mini-test todavía no está abierto."
+        )
+        st.markdown(
+            f"**Apertura:** {format_madrid_datetime(start)}  \n"
+            f"**Cierre:** {format_madrid_datetime(end)}"
+        )
+        st.caption(
+            f"Hora actual: {format_madrid_datetime(now)}"
+        )
+        return False
+
+    if status == "closed":
+        st.warning(
+            "🔒 El plazo del Mini-test ha finalizado."
+        )
+        if end:
+            st.caption(
+                f"El test cerró el {format_madrid_datetime(end)}."
+            )
+        return False
+
+    st.info(
+        "🔒 El Mini-test no está disponible en este momento."
+    )
+    st.caption(
+        "El profesor activará la prueba cuando corresponda."
+    )
+    return False
+
+
+# ============================================================
+# NAVEGACIÓN
+# ============================================================
+
+st.sidebar.markdown("## 📈 Econometría")
+st.sidebar.caption("Universidade de Vigo")
+st.sidebar.button(
+    "🔒 Cerrar sesión",
+    on_click=logout_app,
+    use_container_width=True,
+    key="logout_app_button",
+)
+
+# Mientras exista un intento activo y todavía no se haya enviado,
+# el alumno queda bloqueado dentro del Mini-test.
+quiz_in_progress = (
+    "quiz_questions" in st.session_state
+    and bool(st.session_state.get("quiz_questions"))
+    and not st.session_state.get("quiz_submitted", False)
+)
+
+if quiz_in_progress:
+    navigation_options = ["✅ Mini-test"]
+    st.sidebar.warning(
+        "🔒 Modo examen activo\n\n"
+        "La navegación permanecerá bloqueada hasta enviar la prueba."
+    )
+else:
+    navigation_options = [
+        "🏠 Inicio",
+        "🧭 Temario",
+        "📈 Laboratorio MCO",
+        "🔎 Interpretar coeficientes",
+        "🧪 Contrastes e IC",
+        "🩺 Diagnóstico",
+        "⌨️ Gretl",
+        "✅ Mini-test",
+    ]
+
+if quiz_in_progress:
+    section = st.sidebar.radio(
+        "Navegación",
+        navigation_options,
+        index=0,
+        key="exam_navigation",
+    )
+else:
+    section = st.sidebar.radio(
+        "Navegación",
+        navigation_options,
+        index=0,
+        key="normal_navigation",
+    )
+
+st.sidebar.divider()
+st.sidebar.caption(
+    "Material complementario de clase · "
+    "Prof. Alessandro Indelicato"
+)
+
+professor_panel()
+
+# Segunda barrera: con un intento activo ninguna otra sección puede renderizarse.
+if quiz_in_progress:
+    section = "✅ Mini-test"
+
+
+# ============================================================
+# INICIO
+# ============================================================
+
+if section == "🏠 Inicio":
+
+    st.markdown("""
+    <div class="hero">
+      <div class="kicker">Econometría · ADE, ADE-Dereito · 2026/27</div>
+      <h1>Econometría Interactiva</h1>
+      <p>De la pregunta económica al modelo, la estimación,
+      el diagnóstico y la interpretación.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Bloques", "6")
+    c2.metric("Laboratorios", "5")
+    c3.metric("Mini-test", "10 preguntas")
+    c4.metric("Datos", "CSV / XLSX")
+
+    st.subheader("Cómo vamos a trabajar")
+
+    cols = st.columns(4)
+
+    cards = [
+        (
+            "1 · Pregunta",
+            "Formular una cuestión económica medible y decidir qué variable queremos explicar."
+        ),
+        (
+            "2 · Modelo",
+            "Traducir la pregunta a una ecuación, elegir variables y explicitar supuestos."
+        ),
+        (
+            "3 · Evidencia",
+            "Estimar por MCO, contrastar hipótesis y revisar la calidad del modelo."
+        ),
+        (
+            "4 · Decisión",
+            "Interpretar magnitudes, incertidumbre y límites sin confundir asociación con causalidad."
+        ),
+    ]
+
+    for col, (title, body) in zip(cols, cards):
+        with col:
+            st.markdown(
+                f'<div class="card"><b>{title}</b><p>{body}</p></div>',
+                unsafe_allow_html=True
+            )
+
+    st.subheader("Ruta del curso")
+
+    st.markdown("""
+    **Datos y Gretl** → **Regresión simple y múltiple** →
+    **MCO y ANOVA** → **Inferencia** → **Diagnóstico** →
+    **Informe econométrico reproducible**
+    """)
+
+    st.info(
+        "La app no sustituye Gretl. Sirve para experimentar con los conceptos, "
+        "comprobar interpretaciones y entender qué hay detrás de la salida del programa."
+    )
+
+
+# ============================================================
+# TEMARIO
+# ============================================================
+
+elif section == "🧭 Temario":
+
+    st.title("🧭 Temario y sesiones")
+    st.write(
+        "La secuencia sigue el flujo completo de un análisis econométrico aplicado."
+    )
+
+    sessions = [
+        {
+            "title": "Sesión 1 · Gretl, datos y descriptivos",
+            "goal": "Preparar una base reproducible y mirar los datos antes de estimar.",
+            "topics": [
+                "Estructuras de datos",
+                "Muestra y unidad de observación",
+                "Descriptivos",
+                "Correlación",
+                "Gráficos",
+                "Transformaciones y ficticias",
+            ],
+            "formula": r"\bar{x}=\frac{1}{n}\sum_{i=1}^n x_i,\qquad s^2=\frac{1}{n-1}\sum_{i=1}^n(x_i-\bar{x})^2",
+            "gretl": "open datos.csv\nsummary\ncorr\nscatters y x1 x2",
+            "product": "Dataset limpio + descriptivos + gráfico comentado",
+        },
+        {
+            "title": "Sesión 2 · MRLC y estimación por MCO",
+            "goal": "Entender qué estima una regresión y qué significa ceteris paribus.",
+            "topics": [
+                "Regresión simple y múltiple",
+                "Perturbación",
+                "Exogeneidad",
+                "MCO",
+                "Valores ajustados",
+                "Residuos",
+                "Interpretación económica",
+            ],
+            "formula": r"y_i=\beta_0+\beta_1x_{1i}+\cdots+\beta_kx_{ki}+u_i",
+            "gretl": "ols y const x1 x2 x3",
+            "product": "Modelo formulado, estimado e interpretado",
+        },
+        {
+            "title": "Sesión 3 · MCO matricial, ANOVA y forma funcional",
+            "goal": "Conectar salida econométrica, geometría, varianza y unidades.",
+            "topics": [
+                "Notación matricial",
+                "Proyección",
+                "ANOVA",
+                "R²",
+                "R² ajustado",
+                "Escala",
+                "Logaritmos",
+                "Elasticidades",
+            ],
+            "formula": r"\widehat{\beta}=(X'X)^{-1}X'y,\qquad SCT=SCR+SCE",
+            "gretl": "genr ly = log(y)\ngenr lx1 = log(x1)\nols ly const lx1 x2",
+            "product": "Comparación razonada de especificaciones",
+        },
+        {
+            "title": "Sesión 4 · Inferencia, intervalos y restricciones",
+            "goal": "Incorporar incertidumbre a las afirmaciones econométricas.",
+            "topics": [
+                "Error típico",
+                "t de Student",
+                "p-valor",
+                "Intervalos de confianza",
+                "Contrastes F",
+                "Restricciones lineales",
+            ],
+            "formula": r"t=\frac{\widehat{\beta}_j-\beta_{j,0}}{se(\widehat{\beta}_j)}",
+            "gretl": "ols y const x1 x2 x3\nrestrict\n b[x1] = b[x2]\nend restrict",
+            "product": "Decisión estadística + interpretación económica",
+        },
+        {
+            "title": "Sesión 5 · Multicolinealidad y diagnóstico",
+            "goal": "Detectar problemas de inferencia o especificación.",
+            "topics": [
+                "VIF",
+                "Normalidad",
+                "RESET",
+                "Heterocedasticidad",
+                "White",
+                "Breusch–Pagan",
+                "Autocorrelación",
+                "Errores robustos",
+            ],
+            "formula": r"VIF_j=\frac{1}{1-R_j^2},\qquad Var(u_i\mid X)=\sigma_i^2",
+            "gretl": "vif\nmodtest --normality\nmodtest --squares\nmodtest --white",
+            "product": "Tabla de diagnóstico y decisiones justificadas",
+        },
+        {
+            "title": "Sesión 6 · Taller final e informe econométrico",
+            "goal": "Cerrar el ciclo completo del análisis.",
+            "topics": [
+                "Reproducibilidad",
+                "Selección del modelo",
+                "Robustez",
+                "Interpretación",
+                "Limitaciones",
+                "Asociación vs causalidad",
+                "Defensa oral",
+            ],
+            "formula": r"\text{Pregunta}\rightarrow\text{Datos}\rightarrow\text{Modelo}\rightarrow\text{Diagnóstico}\rightarrow\text{Conclusión}",
+            "gretl": "# El script final debe ejecutarse de principio a fin sin errores",
+            "product": "Informe + base + script Gretl + tabla principal + gráfico",
+        },
+    ]
+
+    for s in sessions:
+        with st.expander(
+            s["title"],
+            expanded=s["title"].startswith("Sesión 1")
+        ):
+            st.markdown(f"**Objetivo:** {s['goal']}")
+            st.markdown("**Conceptos:** " + " · ".join(s["topics"]))
+            st.latex(s["formula"])
+            st.markdown("**Gretl**")
+            st.code(s["gretl"], language="text")
+            st.success("Producto de aula: " + s["product"])
+
+    st.warning(
+        "Regla transversal: una salida estadística nunca termina en el p-valor; "
+        "termina en una interpretación con magnitud, unidades, incertidumbre y límites."
+    )
+
+
+# ============================================================
+# LABORATORIO MCO
+# ============================================================
+
+elif section == "📈 Laboratorio MCO":
+
+    st.title("📈 Laboratorio de regresión MCO")
+    st.write(
+        "Sube la base de datos con la que vas a trabajar en clase."
+    )
+
+    df, source = require_uploaded_dataset(
+        key="lab_dataset",
+        label="Sube la base de datos del ejercicio",
+    )
+
+    st.caption(
+        f"Archivo activo: **{source}** · "
+        f"{len(df)} observaciones · {df.shape[1]} variables"
+    )
+
+    st.dataframe(df.head(12), use_container_width=True)
+
+    num = numeric_columns(df)
+
+    if len(num) < 2:
+        st.error("La base necesita al menos dos variables numéricas.")
+        st.stop()
+
+    default_y = 0
+
+    y = st.selectbox(
+        "Variable dependiente (Y)",
+        num,
+        index=default_y
+    )
+
+    x_candidates = [c for c in num if c != y]
+
+    defaults = x_candidates[: min(2, len(x_candidates))]
+
+    xs = st.multiselect(
+        "Variables explicativas (X)",
+        x_candidates,
+        default=defaults[:4] or x_candidates[:2],
+    )
+
+    robust = st.toggle(
+        "Usar errores estándar robustos HC1",
+        value=False
+    )
+
+    if not xs:
+        st.info("Selecciona al menos una variable explicativa.")
+        st.stop()
+
+    try:
+        model, dat = fit_ols(df, y, xs, robust=robust)
+    except Exception as exc:
+        st.error(f"No se pudo estimar el modelo: {exc}")
+        st.stop()
+
+    st.subheader("1. Modelo estimado")
+    st.code(equation_text(model, y), language="text")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("N", f"{int(model.nobs)}")
+    m2.metric("R²", f"{model.rsquared:.3f}")
+    m3.metric("R² ajustado", f"{model.rsquared_adj:.3f}")
+
+    fp = model.f_pvalue
+    m4.metric(
+        "F · p-valor",
+        f"{fp:.3g}" if np.isfinite(fp) else "—"
+    )
+
+    tab = coef_table(model)
+
+    st.dataframe(
+        tab.style.format({
+            "Coeficiente": "{:.4f}",
+            "Error típico": "{:.4f}",
+            "t": "{:.3f}",
+            "p-valor": "{:.4f}",
+            "IC 95% inf.": "{:.4f}",
+            "IC 95% sup.": "{:.4f}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("2. Interpretación guiada")
+
+    coef_names = [
+        x
+        for x in xs
+        if x in tab["Variable"].tolist()
+    ]
+
+    selected = st.selectbox(
+        "Coeficiente que quieres interpretar",
+        coef_names
+    )
+
+    row = tab.loc[tab["Variable"] == selected].iloc[0]
+
+    b = row["Coeficiente"]
+    p = row["p-valor"]
+    direction = "aumento" if b >= 0 else "disminución"
+
+    st.info(
+        f"Manteniendo constantes las demás variables, "
+        f"un incremento de 1 unidad en **{selected}** se asocia con un "
+        f"**{direction} de {abs(b):.3f} unidades de {y}**. "
+        f"El p-valor es {p:.4f}. "
+        "Esto describe una asociación condicional; por sí solo no demuestra causalidad."
+    )
+
+    st.subheader("3. Ajuste y residuos")
+
+    plot_df = pd.DataFrame({
+        "Ajustado": np.asarray(model.fittedvalues),
+        "Residuo": np.asarray(model.resid),
+        "Observado": dat[y].to_numpy(),
+    })
+
+    fig1 = px.scatter(
+        plot_df,
+        x="Ajustado",
+        y="Residuo",
+        hover_data=["Observado"],
+        title="Residuos frente a valores ajustados",
+    )
+    fig1.add_hline(y=0, line_dash="dash")
+    st.plotly_chart(fig1, use_container_width=True)
+
+    fig2 = px.scatter(
+        plot_df,
+        x="Observado",
+        y="Ajustado",
+        title="Valores observados frente a ajustados",
+    )
+
+    lo = float(
+        min(
+            plot_df["Observado"].min(),
+            plot_df["Ajustado"].min()
+        )
+    )
+    hi = float(
+        max(
+            plot_df["Observado"].max(),
+            plot_df["Ajustado"].max()
+        )
+    )
+
+    fig2.add_shape(
+        type="line",
+        x0=lo,
+        y0=lo,
+        x1=hi,
+        y1=hi,
+        line=dict(dash="dash"),
+    )
+
+    st.plotly_chart(fig2, use_container_width=True)
+
+    out = dat.copy()
+    out["y_ajustada"] = np.asarray(model.fittedvalues)
+    out["residuo"] = np.asarray(model.resid)
+
+    st.download_button(
+        "Descargar datos + ajustes + residuos",
+        data=out.to_csv(index=False).encode("utf-8"),
+        file_name="resultado_mco.csv",
+        mime="text/csv",
+    )
+
+    with st.expander("Resumen técnico completo"):
+        st.text(model.summary().as_text())
+
+
+# ============================================================
+# INTERPRETACIÓN
+# ============================================================
+
+elif section == "🔎 Interpretar coeficientes":
+
+    st.title("🔎 Interpretar coeficientes")
+    st.write(
+        "Entrena la traducción de una fórmula a una frase económica correcta."
+    )
+
+    form = st.selectbox(
+        "Forma funcional",
+        [
+            "Nivel–nivel: Y = β0 + β1 X",
+            "Log–nivel: ln(Y) = β0 + β1 X",
+            "Nivel–log: Y = β0 + β1 ln(X)",
+            "Log–log: ln(Y) = β0 + β1 ln(X)",
+        ],
+    )
+
+    b = st.number_input(
+        "Coeficiente estimado β̂₁",
+        value=0.2500,
+        step=0.01,
+        format="%.4f",
+    )
+
+    delta = st.number_input(
+        "Cambio en X que quieres interpretar",
+        value=1.0,
+        step=0.5,
+    )
+
+    st.subheader("Interpretación")
+
+    if form.startswith("Nivel–nivel"):
+        change = b * delta
+        st.latex(r"\Delta Y \approx \widehat{\beta}_1\Delta X")
+        st.success(
+            f"Un aumento de {delta:g} unidades en X se asocia con "
+            f"un cambio de {change:.4g} unidades en Y, ceteris paribus."
+        )
+
+    elif form.startswith("Log–nivel"):
+        approx_pct = 100 * b * delta
+        exact_pct = 100 * (math.exp(b * delta) - 1)
+
+        st.latex(
+            r"\%\Delta Y \approx 100\widehat{\beta}_1\Delta X"
+        )
+
+        st.success(
+            f"Aproximación: X +{delta:g} → Y cambia aproximadamente "
+            f"{approx_pct:.2f}%. Cambio exacto: {exact_pct:.2f}%."
+        )
+
+    elif form.startswith("Nivel–log"):
+        pct_x = st.number_input(
+            "Cambio porcentual de X",
+            value=10.0,
+            step=1.0,
+        )
+
+        change_y = b * (pct_x / 100)
+
+        st.latex(
+            r"\Delta Y \approx \widehat{\beta}_1\frac{\%\Delta X}{100}"
+        )
+
+        st.success(
+            f"Un aumento del {pct_x:g}% en X se asocia con un "
+            f"cambio de {change_y:.4g} unidades en Y."
+        )
 
     else:
-        ts=st.segmented_control("Time-series model",["Stationarity","ARIMA","VAR"],default="ARIMA")
-        if ts=="Stationarity":
-            from statsmodels.tsa.stattools import adfuller,kpss
-            y=st.selectbox("Series",nums,key="ts_stationary_y")
-            if st.button("RUN ADF + KPSS",type="primary"):
-                try:
-                    s=df[y].dropna()
-                    adf=adfuller(s,autolag="AIC");kp=kpss(s,regression="c",nlags="auto")
-                    st.dataframe(pd.DataFrame([
-                        ["ADF",adf[0],adf[1],"Unit root"],
-                        ["KPSS",kp[0],kp[1],"Stationary"]
-                    ],columns=["test","statistic","p_value","null_hypothesis"]),use_container_width=True,hide_index=True)
-                except Exception as e: st.exception(e)
-        elif ts=="ARIMA":
-            y=st.selectbox("Series",nums,key="ts_arima_y")
-            c1,c2,c3=st.columns(3)
-            p=c1.number_input("p",0,10,1);d=c2.number_input("d",0,3,0);q=c3.number_input("q",0,10,1)
-            exog=st.multiselect("Exogenous variables",[c for c in nums if c!=y],key="ts_arima_x")
-            name=st.text_input("Model name",f"ARIMA({p},{d},{q}) — {y}",key="ts_arima_name")
-            if st.button("RUN ARIMA",type="primary",use_container_width=True):
-                try:
-                    estimated=fit_arima(df,name,y,p,d,q,exog);save_model(estimated)
-                except Exception as e: st.exception(e)
-        else:
-            vars_=st.multiselect("Endogenous variables",nums,default=nums[:min(2,len(nums))],key="ts_var_vars")
-            lags=st.number_input("Lags",1,12,1)
-            name=st.text_input("Model name",f"VAR({lags})",key="ts_var_name")
-            if st.button("RUN VAR",type="primary",use_container_width=True,disabled=len(vars_)<2):
-                try:
-                    estimated=fit_var(df,name,vars_,lags);save_model(estimated)
-                except Exception as e: st.exception(e)
+        pct_x = st.number_input(
+            "Cambio porcentual de X",
+            value=10.0,
+            step=1.0,
+        )
 
-    if st.session_state.current_model is not None:
-        st.divider()
-        render_model_result(st.session_state.current_model,df)
+        approx_pct_y = b * pct_x
+
+        st.latex(
+            r"\%\Delta Y \approx \widehat{\beta}_1\,\%\Delta X"
+        )
+
+        st.success(
+            f"β̂₁ es una elasticidad: un aumento del {pct_x:g}% en X "
+            f"se asocia con un cambio aproximado del {approx_pct_y:.2f}% en Y."
+        )
+
+    st.warning(
+        "Tres elementos deben aparecer siempre: magnitud, unidad y ceteris paribus. "
+        "La significación estadística se comenta aparte."
+    )
+
 
 # ============================================================
-# RESEARCH LAB
+# CONTRASTES
 # ============================================================
-elif page=="🧪 Research Lab":
-    df=need_data();nums=numeric_columns(df)
-    hero("Research Lab","Diagnose assumptions, stress-test specifications and interrogate identification.","Robustness & causal diagnostics")
-    tabs=st.tabs(["Model health","Robustness","Specification curve","Event study","Compare models","Fuzzy","Econometric assistant"])
 
-    with tabs[0]:
-        if not st.session_state.models:
-            st.info("Estimate at least one model in Model Studio.")
-        else:
-            mn=st.selectbox("Model",[m.name for m in st.session_state.models],key="health_model")
-            m=next(x for x in st.session_state.models if x.name==mn)
-            model_header(m)
-            render_health_table(m)
-            if m.residuals is not None:
-                c1,c2=st.columns(2)
-                c1.plotly_chart(pub_fig(residual_fitted(m)),use_container_width=True)
-                c2.plotly_chart(pub_fig(qq_plot(m)),use_container_width=True)
+elif section == "🧪 Contrastes e IC":
 
-    with tabs[1]:
-        st.markdown("### OLS robustness battery")
-        if not nums:
-            st.info("Numeric variables required.")
-        else:
-            y=st.selectbox("Outcome",nums,key="rob_y")
-            focal=st.selectbox("Main coefficient",[c for c in nums if c!=y],key="rob_focal")
-            controls=st.multiselect("Baseline controls",[c for c in nums if c not in [y,focal]],key="rob_ctrl")
-            c1,c2=st.columns(2)
-            cluster=c1.selectbox("Cluster variable",["None"]+df.columns.tolist(),key="rob_cluster")
-            cluster=None if cluster=="None" else cluster
-            fe_vars=c2.multiselect("Fixed-effect controls",[c for c in df.columns if c not in [y,focal] and c not in controls],
-                                   key="rob_fe")
-            winsor=st.multiselect("Winsorize at 1% / 99%",[c for c in nums if c!=y],key="rob_win")
-            infl=st.checkbox("Exclude influential observations using Cook's D > 4/N",value=True)
-            if st.button("RUN ROBUSTNESS BATTERY",type="primary",use_container_width=True):
-                try:
-                    res,rob_models=robustness_ols(df,y,focal,controls,cluster,fe_vars,winsor,infl)
-                    st.session_state["robustness_result"]=res
-                    st.dataframe(res,use_container_width=True,hide_index=True)
-                    if len(res):
-                        fig=go.Figure(go.Scatter(
-                            x=res["coef"],y=res["specification"],mode="markers",
-                            error_x=dict(type="data",symmetric=False,
-                                         array=res["ci_high"]-res["coef"],
-                                         arrayminus=res["coef"]-res["ci_low"])
-                        ))
-                        fig.add_vline(x=0,line_dash="dash")
-                        fig.update_xaxes(title=f"Coefficient: {focal} (95% CI)")
-                        fig=pub_fig(style(fig,"Robustness of focal coefficient"))
-                        st.plotly_chart(fig,use_container_width=True);download_figure(fig,"robustness")
-                        sig=(res["p_value"]<.05).sum()
-                        sign_consistency=max((res["coef"]>0).sum(),(res["coef"]<0).sum())
-                        st.info(f"Sign is consistent in **{sign_consistency}/{len(res)}** specifications; p < .05 in **{sig}/{len(res)}**.")
-                except Exception as e: st.exception(e)
+    st.title("🧪 Contrastes de hipótesis e intervalos")
+    st.write(
+        "Experimenta con H₀ y observa cómo cambian t, p-valor y decisión."
+    )
 
-    with tabs[2]:
-        y=st.selectbox("Outcome",nums,key="sc_y")
-        focal=st.selectbox("Focal variable",[c for c in nums if c!=y],key="sc_focal")
-        candidate=st.multiselect("Candidate controls",[c for c in nums if c not in [y,focal]],key="sc_controls")
-        max_controls=st.slider("Maximum controls per model",0,min(5,len(candidate)),min(3,len(candidate)))
-        max_specs=st.slider("Maximum specifications",10,200,100,10)
-        if st.button("RUN SPECIFICATION CURVE",type="primary",use_container_width=True):
-            rows=[]
-            combos=[]
-            for k in range(max_controls+1):
-                combos.extend(list(combinations(candidate,k)))
-            for i,ctrl in enumerate(combos[:max_specs],1):
-                try:
-                    mm=fit_cross_section(df,f"Spec {i}","OLS",y,[focal]+list(ctrl),cov="HC3")
-                    rr=mm.coef_table[mm.coef_table.term==focal].iloc[0]
-                    rows.append({"spec":i,"controls":", ".join(ctrl) or "None","coef":rr.coef,
-                                 "low":rr.ci_low,"high":rr.ci_high,"p":rr.p_value})
-                except Exception:
-                    pass
-            res=pd.DataFrame(rows)
-            st.dataframe(res,use_container_width=True,hide_index=True)
-            if len(res):
-                fig=go.Figure(go.Scatter(
-                    x=res["spec"],y=res["coef"],mode="markers",
-                    error_y=dict(type="data",symmetric=False,array=res["high"]-res["coef"],arrayminus=res["coef"]-res["low"]),
-                    marker=dict(size=7)
-                ))
-                fig.add_hline(y=0,line_dash="dash")
-                fig.update_xaxes(title="Specification");fig.update_yaxes(title=f"Estimate: {focal}")
-                fig=pub_fig(style(fig,"Specification curve"))
-                st.plotly_chart(fig,use_container_width=True);download_figure(fig,"specification_curve")
+    df, source = require_uploaded_dataset(
+        key="contrast_dataset",
+        label="Sube la base de datos para el contraste",
+    )
+    st.caption(f"Archivo activo: **{source}**")
+    num = numeric_columns(df)
 
-    with tabs[3]:
-        st.markdown("### Event Study")
-        y=st.selectbox("Outcome",nums,key="ev_y")
-        treat=st.selectbox("Treatment indicator",nums,key="ev_treat")
-        rel=st.selectbox("Relative-time variable",df.columns.tolist(),key="ev_rel")
-        controls=st.multiselect("Controls",[c for c in nums if c not in [y,treat] and c!=rel],key="ev_controls")
-        c1,c2,c3=st.columns(3)
-        unit=c1.selectbox("Unit FE / cluster",["None"]+df.columns.tolist(),key="ev_unit");unit=None if unit=="None" else unit
-        time=c2.selectbox("Calendar-time FE",["None"]+df.columns.tolist(),key="ev_time");time=None if time=="None" else time
-        ref=c3.number_input("Reference period",value=-1)
-        if st.button("RUN EVENT STUDY",type="primary",use_container_width=True):
-            try:
-                es,formula,_=event_study(df,y,treat,rel,controls,unit,time,ref,cluster=True)
-                st.code(formula,language="text")
-                st.dataframe(es,use_container_width=True,hide_index=True)
-                if len(es):
-                    fig=go.Figure(go.Scatter(
-                        x=es["period"],y=es["coef"],mode="markers+lines",
-                        error_y=dict(type="data",symmetric=False,array=es["ci_high"]-es["coef"],arrayminus=es["coef"]-es["ci_low"])
-                    ))
-                    fig.add_hline(y=0,line_dash="dash");fig.add_vline(x=0,line_dash="dot")
-                    fig.update_xaxes(title="Relative time");fig.update_yaxes(title="Treatment effect (95% CI)")
-                    fig=pub_fig(style(fig,"Event-study estimates"))
-                    st.plotly_chart(fig,use_container_width=True);download_figure(fig,"event_study")
-            except Exception as e: st.exception(e)
+    default_y = 0
 
-    with tabs[4]:
-        models=st.session_state.models
-        if not models:
-            st.info("No models saved.")
-        else:
-            chosen_names=st.multiselect("Models",[m.name for m in models],default=[m.name for m in models[-min(4,len(models)):]],key="cmp_models")
-            chosen=[m for m in models if m.name in chosen_names]
-            if chosen:
-                st.dataframe(comparison_table(chosen),use_container_width=True)
-                common=set(chosen[0].coef_table.term)
-                for mm in chosen[1:]: common &= set(mm.coef_table.term)
-                common=sorted(common-set(["Intercept","const"]))
-                if common:
-                    term=st.selectbox("Graph common coefficient",common,key="cmp_term")
-                    fig=pub_fig(model_comparison(chosen,term))
-                    st.plotly_chart(fig,use_container_width=True);download_figure(fig,"model_comparison")
+    y = st.selectbox(
+        "Y",
+        num,
+        index=default_y,
+        key="contrast_y",
+    )
 
-    with tabs[5]:
-        subt=st.segmented_control("Fuzzy method",["Likert fuzzy index","TOPSIS"],default="Likert fuzzy index")
-        if subt=="Likert fuzzy index":
-            items=st.multiselect("Likert items (1–5)",nums,key="fz_items")
-            method=st.radio("Defuzzification",["centroid","weighted"],horizontal=True,key="fz_method")
-            new=st.text_input("New variable","fuzzy_index",key="fz_new")
-            if st.button("CREATE FUZZY INDEX",disabled=not items):
-                try:
-                    out=df.copy();out[new]=fuzzy_index(out,items,method=method)
-                    set_df(out,st.session_state.source_name,st.session_state.column_map)
-                    st.success(f"Created `{new}`.")
-                except Exception as e: st.exception(e)
-        else:
-            crit=st.multiselect("Criteria",nums,key="tp_crit")
-            benefits=[]
-            for c in crit:
-                benefits.append(st.checkbox(f"{c}: higher is better",value=True,key=f"tp_{c}"))
-            new=st.text_input("New score","topsis_score",key="tp_new")
-            if st.button("COMPUTE TOPSIS",disabled=not crit):
-                try:
-                    out=df.copy();out[new]=topsis(out,crit,benefit=benefits)
-                    set_df(out,st.session_state.source_name,st.session_state.column_map)
-                    st.success(f"Created `{new}`.")
-                except Exception as e: st.exception(e)
+    xs_all = [c for c in num if c != y]
 
-    with tabs[6]:
-        y=st.selectbox("Outcome to analyse",["None"]+df.columns.tolist(),key="assist_y")
-        st.markdown(assistant_recommendation(df,None if y=="None" else y))
-        st.caption("This assistant is rule-based and transparent: it does not send your dataset to an external AI service.")
+    defaults = xs_all[: min(2, len(xs_all))]
 
-# ============================================================
-# SIMULATOR
-# ============================================================
-elif page=="🎮 Simulator":
-    df=need_data()
-    hero("Simulator","Turn an estimated model into profiles, predictions and counterfactual comparisons.","Prediction playground")
-    usable=[m for m in st.session_state.models
-            if m.result is not None and hasattr(m.result,"predict")
-            and m.family in ("OLS","WLS","Linear Probability Model","Logit","Probit","Cloglog","Poisson","Negative Binomial")]
-    if not usable:
-        st.info("Estimate a formula-based cross-sectional model first.")
-        st.stop()
-    mn=st.selectbox("Model",[m.name for m in usable])
-    model=next(m for m in usable if m.name==mn)
-    model_header(model)
+    xs = st.multiselect(
+        "X",
+        xs_all,
+        default=defaults[:4] or xs_all[:2],
+        key="contrast_x",
+    )
 
-    vars_in=[c for c in df.columns if c in model.formula and c!=model.y_name]
-    if not vars_in:
-        st.info("No editable regressors detected in the formula.")
+    if not xs:
         st.stop()
 
-    st.markdown("### Compare two profiles")
-    profile_a={};profile_b={}
-    ca,cb=st.columns(2)
-    for c in vars_in:
-        if pd.api.types.is_numeric_dtype(df[c]):
-            lo=float(df[c].quantile(.01));hi=float(df[c].quantile(.99));med=float(df[c].median())
-            if np.isfinite(lo) and np.isfinite(hi) and lo<hi:
-                with ca: profile_a[c]=st.slider(c+" · A",lo,hi,med,key=f"sim_a_{c}")
-                with cb: profile_b[c]=st.slider(c+" · B",lo,hi,med,key=f"sim_b_{c}")
-            else:
-                profile_a[c]=profile_b[c]=med
-        else:
-            vals=df[c].dropna().astype(str).unique().tolist()
-            with ca: profile_a[c]=st.selectbox(c+" · A",vals,key=f"sim_a_{c}")
-            with cb: profile_b[c]=st.selectbox(c+" · B",vals,key=f"sim_b_{c}")
+    model, dat = fit_ols(df, y, xs)
+
+    coef = st.selectbox(
+        "Parámetro a contrastar",
+        xs
+    )
+
+    h0 = st.number_input(
+        "Valor bajo H₀: βj =",
+        value=0.0,
+        step=0.1,
+    )
+
+    alpha = st.select_slider(
+        "Nivel de significación α",
+        options=[0.10, 0.05, 0.01],
+        value=0.05,
+    )
+
+    # Acceso por nombre de variable: evita KeyError con pandas recientes
+    b = float(model.params[coef])
+    se = float(model.bse[coef])
+    df_resid = float(model.df_resid)
+
+    t_stat = (b - h0) / se
+    pval = 2 * stats.t.sf(abs(t_stat), df_resid)
+
+    crit = stats.t.ppf(
+        1 - alpha / 2,
+        df_resid
+    )
+
+    ci = (
+        b - crit * se,
+        b + crit * se,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("β̂", f"{b:.4f}")
+    c2.metric("SE", f"{se:.4f}")
+    c3.metric("t", f"{t_stat:.3f}")
+    c4.metric("p-valor", f"{pval:.4g}")
+
+    st.latex(
+        r"t=\frac{\widehat{\beta}_j-\beta_{j,0}}{se(\widehat{\beta}_j)}"
+    )
+
+    st.write(
+        f"IC {(1-alpha)*100:.0f}%: "
+        f"**[{ci[0]:.4f}, {ci[1]:.4f}]**"
+    )
+
+    if pval < alpha:
+        st.success(
+            f"Como p = {pval:.4g} < α = {alpha:.2f}, rechazamos H₀."
+        )
+    else:
+        st.info(
+            f"Como p = {pval:.4g} ≥ α = {alpha:.2f}, no rechazamos H₀."
+        )
+
+    st.caption(
+        "«No rechazar H₀» no significa demostrar que H₀ sea verdadera."
+    )
+
+
+# ============================================================
+# DIAGNÓSTICO
+# ============================================================
+
+elif section == "🩺 Diagnóstico":
+
+    st.title("🩺 Diagnóstico del modelo")
+    st.write(
+        "Cada prueba responde a una pregunta distinta sobre el modelo."
+    )
+
+    df, source = require_uploaded_dataset(
+        key="diag_dataset",
+        label="Sube la base de datos para el diagnóstico",
+    )
+    st.caption(f"Archivo activo: **{source}**")
+    num = numeric_columns(df)
+
+    default_y = 0
+
+    y = st.selectbox(
+        "Y",
+        num,
+        index=default_y,
+        key="diag_y",
+    )
+
+    xs_all = [c for c in num if c != y]
+
+    defaults = xs_all[: min(2, len(xs_all))]
+
+    xs = st.multiselect(
+        "X",
+        xs_all,
+        default=defaults[:4] or xs_all[:2],
+        key="diag_x",
+    )
+
+    if not xs:
+        st.stop()
+
+    model, dat = fit_ols(df, y, xs)
+
+    resid = np.asarray(model.resid)
+    exog = np.asarray(model.model.exog)
+
+    st.subheader("Multicolinealidad · VIF")
+
+    vif_rows = []
+
+    for i, name in enumerate(model.model.exog_names):
+
+        if name == "const":
+            continue
+
+        try:
+            vif = variance_inflation_factor(exog, i)
+        except Exception:
+            vif = np.nan
+
+        vif_rows.append({
+            "Variable": name,
+            "VIF": vif
+        })
+
+    vif_df = pd.DataFrame(vif_rows)
+
+    st.dataframe(
+        vif_df.style.format({"VIF": "{:.2f}"}),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.caption(
+        "Los VIF elevados alertan de pérdida de precisión por colinealidad. "
+        "No existe un umbral universal que sustituya el juicio sustantivo."
+    )
+
+    st.subheader("Pruebas de diagnóstico")
+
+    rows = []
+
     try:
-        pa=float(np.asarray(model.result.predict(pd.DataFrame([profile_a]))).ravel()[0])
-        pb=float(np.asarray(model.result.predict(pd.DataFrame([profile_b]))).ravel()[0])
-        c1,c2,c3=st.columns(3)
-        c1.metric("Profile A",f"{pa:.4f}")
-        c2.metric("Profile B",f"{pb:.4f}")
-        if model.family in ("Logit","Probit","Cloglog","Linear Probability Model"):
-            c3.metric("Difference",f"{(pb-pa)*100:+.2f} pp")
-        else:
-            c3.metric("Difference",f"{pb-pa:+.4f}")
-        comp=pd.DataFrame({"Variable":vars_in,"Profile A":[profile_a[v] for v in vars_in],"Profile B":[profile_b[v] for v in vars_in]})
-        st.dataframe(comp,use_container_width=True,hide_index=True)
-    except Exception as e:
-        st.exception(e)
+        lm, lm_p, f, f_p = het_breuschpagan(resid, exog)
+        rows.append([
+            "Breusch–Pagan",
+            "Homoscedasticidad",
+            lm,
+            lm_p,
+        ])
+    except Exception:
+        pass
+
+    try:
+        lm, lm_p, f, f_p = het_white(resid, exog)
+        rows.append([
+            "White",
+            "Homoscedasticidad / especificación",
+            lm,
+            lm_p,
+        ])
+    except Exception:
+        pass
+
+    try:
+        jb, jb_p, skew, kurt = jarque_bera(resid)
+        rows.append([
+            "Jarque–Bera",
+            "Normalidad de residuos",
+            jb,
+            jb_p,
+        ])
+    except Exception:
+        pass
+
+    try:
+        reset = linear_reset(
+            model,
+            power=2,
+            use_f=True
+        )
+
+        rows.append([
+            "RESET",
+            "Forma funcional",
+            float(reset.fvalue),
+            float(reset.pvalue),
+        ])
+    except Exception:
+        pass
+
+    test_df = pd.DataFrame(
+        rows,
+        columns=[
+            "Prueba",
+            "Pregunta",
+            "Estadístico",
+            "p-valor",
+        ],
+    )
+
+    st.dataframe(
+        test_df.style.format({
+            "Estadístico": "{:.3f}",
+            "p-valor": "{:.4f}",
+        }),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    dw = durbin_watson(resid)
+
+    st.metric(
+        "Durbin–Watson",
+        f"{dw:.3f}"
+    )
+
+    st.caption(
+        "DW ≈ 2 es compatible con ausencia de autocorrelación AR(1), "
+        "pero su uso debe ser coherente con la estructura de los datos."
+    )
+
+    plot_df = pd.DataFrame({
+        "Ajustado": np.asarray(model.fittedvalues),
+        "Residuo": resid,
+    })
+
+    fig = px.scatter(
+        plot_df,
+        x="Ajustado",
+        y="Residuo",
+        title="Residuos frente a valores ajustados",
+    )
+
+    fig.add_hline(
+        y=0,
+        line_dash="dash"
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
+
+    st.info(
+        "Si una prueba detecta un problema, la pregunta importante es: "
+        "¿qué consecuencia tiene para la estimación o la inferencia "
+        "y qué actuación está justificada?"
+    )
+
 
 # ============================================================
-# REPORT
+# GRETL
 # ============================================================
-elif page=="📑 Report":
-    df=need_data()
-    hero("Report","Compare specifications, export results and recover reproducible code.","Results & reproducibility")
-    tabs=st.tabs(["Model table","Export","Code","Manage"])
-    models=st.session_state.models
-    with tabs[0]:
-        if not models:
-            st.info("No saved models.")
+
+elif section == "⌨️ Gretl":
+
+    st.title("⌨️ Generador de script Gretl")
+    st.write(
+        "Selecciona un modelo y genera una plantilla reproducible."
+    )
+
+    df, source = require_uploaded_dataset(
+        key="gretl_dataset",
+        label="Sube la base de datos para generar el script",
+    )
+    st.caption(f"Archivo activo: **{source}**")
+    num = numeric_columns(df)
+
+    default_y = 0
+
+    y = st.selectbox(
+        "Variable dependiente",
+        num,
+        index=default_y,
+        key="gretl_y",
+    )
+
+    xs_all = [c for c in num if c != y]
+
+    defaults = xs_all[: min(2, len(xs_all))]
+
+    xs = st.multiselect(
+        "Explicativas",
+        xs_all,
+        default=defaults[:4] or xs_all[:2],
+        key="gretl_x",
+    )
+
+    if xs:
+        script = gretl_script(y, xs, filename=source)
+
+        st.code(
+            script,
+            language="text"
+        )
+
+        st.download_button(
+            "Descargar script .inp",
+            data=script.encode("utf-8"),
+            file_name="modelo_gretl.inp",
+            mime="text/plain",
+        )
+
+    st.subheader("Comandos que debes reconocer")
+
+    st.markdown("""
+    - `open` — abrir una base.
+    - `summary` — estadísticos descriptivos.
+    - `corr` — correlaciones.
+    - `genr` — generar transformaciones.
+    - `ols` — estimar por MCO.
+    - `restrict` — contrastar restricciones lineales.
+    - `vif` — diagnóstico de multicolinealidad.
+    - `modtest` — pruebas de especificación y diagnóstico.
+    - `smpl` — modificar la muestra activa.
+    """)
+
+    st.warning(
+        "La plantilla debe adaptarse a los nombres de variables "
+        "y a la estructura real de cada base."
+    )
+
+
+# ============================================================
+# QUIZ
+# ============================================================
+
+elif section == "✅ Mini-test":
+
+    st.title("✅ Mini-test de Econometría")
+    st.write(
+        "Selecciona el temario y realiza una prueba aleatoria de hasta 10 preguntas. "
+        "La prueba se envía al profesor; no se muestra la calificación ni las soluciones."
+    )
+
+    # El banco y las preguntas solo se cargan cuando el examen está abierto.
+    if not enforce_test_gate_for_students():
+        st.stop()
+
+    try:
+        bank = load_question_bank()
+    except Exception as exc:
+        st.error("No se pudo cargar el banco de preguntas.")
+        st.code(str(exc), language="text")
+        st.info(
+            f"Debe existir `{BANK_FILENAME}` en la raíz del repositorio "
+            "y contener la hoja `Todas`."
+        )
+        st.stop()
+
+    st.caption(
+        f"Banco cargado: {len(bank):,} preguntas disponibles."
+        .replace(",", ".")
+    )
+
+    # --------------------------------------------------------
+    # Identificación del estudiante
+    # --------------------------------------------------------
+
+    st.subheader("1. Identificación")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        student_name = st.text_input(
+            "Nombre y apellidos *",
+            placeholder="Nombre Apellido1 Apellido2",
+        )
+
+    with col2:
+        student_dni = st.text_input(
+            "DNI *",
+            placeholder="Ej.: 12345678Z",
+        )
+
+    with col3:
+        student_nie = st.text_input(
+            "NIE *",
+            placeholder="Introduce tu NIE",
+        )
+
+    col4, col5 = st.columns(2)
+
+    with col4:
+        student_email = st.text_input(
+            "Correo UVigo *",
+            placeholder="usuario@uvigo.gal",
+        )
+
+    with col5:
+        student_group = st.text_input(
+            "Grupo",
+            placeholder="Ej.: ADE B4",
+        )
+
+    # --------------------------------------------------------
+    # Contenido fijado por el profesor
+    # --------------------------------------------------------
+
+    status_gate, control_gate, _, _, _ = get_test_gate_status()
+
+    exam_id = control_gate.get("exam_id")
+    selected_fichas = control_gate.get("selected_fichas") or []
+    selected_topics = control_gate.get("selected_topics") or []
+    n_questions = int(control_gate.get("n_questions") or 10)
+
+    if not exam_id:
+        st.error(
+            "La convocatoria no está correctamente inicializada. "
+            "El profesor debe cerrar y volver a abrir el test."
+        )
+        st.stop()
+
+    # Si el profesor ha abierto una convocatoria nueva, no se reutiliza
+    # ningún estado de una convocatoria anterior.
+    if (
+        "quiz_exam_id" in st.session_state
+        and st.session_state.quiz_exam_id != exam_id
+    ):
+        reset_quiz_state()
+
+    if not selected_fichas:
+        st.error(
+            "El profesor no ha configurado todavía el contenido del examen."
+        )
+        st.stop()
+
+    # El alumno no puede modificar ficha, tema ni número de preguntas.
+    selected_labels = [
+        FICHA_LABELS.get(f, f)
+        for f in selected_fichas
+    ]
+
+    if "quiz_questions" not in st.session_state:
+
+        if st.button(
+            "▶️ Iniciar test",
+            type="primary",
+            use_container_width=True,
+        ):
+
+            if (
+                not student_name.strip()
+                or not student_dni.strip()
+                or not student_nie.strip()
+                or not student_email.strip()
+            ):
+                st.warning(
+                    "Introduce nombre y apellidos, DNI, NIE y correo UVigo "
+                    "antes de iniciar la prueba."
+                )
+
+            else:
+                participant_key = make_participant_key(
+                    student_dni,
+                    student_nie,
+                )
+
+                saved_attempt = get_saved_attempt(
+                    exam_id,
+                    participant_key,
+                )
+
+                # Ya terminó esta convocatoria: no puede iniciar otra.
+                if (
+                    saved_attempt
+                    and saved_attempt["status"] == "submitted"
+                ):
+                    st.error(
+                        "⛔ Ya has realizado el único intento permitido "
+                        "para esta convocatoria."
+                    )
+
+                # Empezó antes pero no envió: recupera exactamente
+                # las mismas preguntas y el mismo orden.
+                elif saved_attempt:
+                    st.session_state.quiz_questions = (
+                        saved_attempt["questions"]
+                    )
+                    st.session_state.quiz_attempt_id = (
+                        saved_attempt["attempt_id"]
+                    )
+                    st.session_state.quiz_exam_id = exam_id
+                    st.session_state.quiz_participant_key = (
+                        participant_key
+                    )
+                    st.session_state.quiz_selected_labels = (
+                        selected_labels
+                    )
+                    st.session_state.quiz_selected_topics = (
+                        selected_topics
+                    )
+                    st.session_state.quiz_submitted = False
+
+                    st.info(
+                        "Se ha recuperado tu intento ya iniciado. "
+                        "No se han generado preguntas nuevas."
+                    )
+                    st.rerun()
+
+                else:
+                    candidates = [
+                        q for q in bank
+                        if q["ficha"] in selected_fichas
+                        and (
+                            not selected_topics
+                            or q["tema"] in selected_topics
+                        )
+                    ]
+
+                    if not candidates:
+                        st.warning(
+                            "No hay preguntas disponibles para "
+                            "la configuración del profesor."
+                        )
+
+                    else:
+                        k = min(
+                            n_questions,
+                            len(candidates),
+                        )
+
+                        secure_random = random.SystemRandom()
+
+                        chosen = secure_random.sample(
+                            candidates,
+                            k,
+                        )
+
+                        attempt_id = str(uuid.uuid4())
+                        frozen_questions = []
+
+                        for q in chosen:
+                            qcopy = dict(q)
+                            shuffled = list(
+                                qcopy["opciones"]
+                            )
+                            secure_random.shuffle(
+                                shuffled
+                            )
+                            qcopy["opciones"] = shuffled
+                            frozen_questions.append(
+                                qcopy
+                            )
+
+                        secure_random.shuffle(
+                            frozen_questions
+                        )
+
+                        # Registro atómico: solo un intento puede existir
+                        # para este DNI+NIE en esta convocatoria.
+                        registered = register_attempt(
+                            exam_id=exam_id,
+                            participant_key=participant_key,
+                            attempt_id=attempt_id,
+                            questions=frozen_questions,
+                        )
+
+                        if registered["status"] == "submitted":
+                            st.error(
+                                "⛔ Ya has realizado el único intento "
+                                "permitido para esta convocatoria."
+                            )
+                        else:
+                            st.session_state.quiz_questions = (
+                                registered["questions"]
+                            )
+                            st.session_state.quiz_attempt_id = (
+                                registered["attempt_id"]
+                            )
+                            st.session_state.quiz_exam_id = exam_id
+                            st.session_state.quiz_participant_key = (
+                                participant_key
+                            )
+                            st.session_state.quiz_selected_labels = (
+                                selected_labels
+                            )
+                            st.session_state.quiz_selected_topics = (
+                                selected_topics
+                            )
+                            st.session_state.quiz_submitted = False
+                            st.rerun()
+
+    # --------------------------------------------------------
+    # Test congelado
+    # --------------------------------------------------------
+
+    if "quiz_questions" in st.session_state:
+
+        questions = st.session_state.quiz_questions
+        attempt_id = st.session_state.quiz_attempt_id
+
+        st.divider()
+        st.subheader("2. Prueba")
+
+        st.info(
+            f"Se han seleccionado {len(questions)} preguntas al azar. "
+            "Cada estudiante dispone de un único intento en esta convocatoria. "
+            "Si recargas o vuelves a entrar, recuperarás estas mismas preguntas "
+            "y el mismo orden. Durante el intento, las demás secciones de la "
+            "aplicación quedan bloqueadas hasta enviar la prueba."
+        )
+
+        if st.session_state.get("quiz_submitted", False):
+            st.success(
+                "✅ Prueba registrada correctamente."
+            )
+            st.write(
+                "Has utilizado el único intento permitido para esta convocatoria. "
+                "Tu prueba queda guardada y se enviará al profesor junto con las "
+                "del resto de estudiantes cuando se cierre la sesión. "
+                "No se muestra la puntuación ni las respuestas correctas. "
+                "La navegación de la aplicación vuelve a estar disponible."
+            )
+
         else:
-            chosen_names=st.multiselect("Models",[m.name for m in models],default=[m.name for m in models],key="rep_models")
-            chosen=[m for m in models if m.name in chosen_names]
-            if chosen:
-                table=comparison_table(chosen)
-                st.dataframe(table,use_container_width=True)
-                st.caption("* p<0.10, ** p<0.05, *** p<0.01. Standard errors in parentheses.")
-    with tabs[1]:
-        if not models:
-            st.info("No saved models.")
-        else:
-            chosen_names=st.multiselect("Models to export",[m.name for m in models],default=[m.name for m in models],key="export_models")
-            chosen=[m for m in models if m.name in chosen_names]
-            c1,c2,c3=st.columns(3)
-            if chosen:
-                c1.download_button("Excel",models_excel(chosen),"econometrics_lab_results.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
-                c2.download_button("Word",docx_report(chosen),"econometrics_lab_report.docx","application/vnd.openxmlformats-officedocument.wordprocessingml.document",use_container_width=True)
-                c3.download_button("PDF",pdf_report(chosen),"econometrics_lab_report.pdf","application/pdf",use_container_width=True)
-            st.download_button("Current dataset (CSV)",df.to_csv(index=False).encode(),"analysis_dataset.csv","text/csv")
-    with tabs[2]:
-        family=st.selectbox("Model",["OLS","Logit","Probit","Poisson"],key="code_family")
-        y=st.selectbox("Dependent variable",df.columns.tolist(),key="code_y")
-        x=st.multiselect("Regressors",[c for c in df.columns if c!=y],key="code_x")
-        lang=st.radio("Language",["Python","R","Stata","Gretl"],horizontal=True,key="code_lang")
-        code=generate_code(lang,family,y,x)
-        st.code(code,language={"Python":"python","R":"r","Stata":"stata","Gretl":"text"}[lang])
-    with tabs[3]:
-        if not models:
-            st.info("No saved models.")
-        else:
-            st.dataframe(pd.DataFrame([{"Model":m.name,"Family":m.family,"Created":m.created,"Formula":m.formula} for m in models]),use_container_width=True,hide_index=True)
-            delete=st.selectbox("Delete model",["None"]+[m.name for m in models])
-            c1,c2=st.columns(2)
-            if c1.button("Delete selected",disabled=delete=="None",use_container_width=True):
-                st.session_state.models=[m for m in models if m.name!=delete]
-                if st.session_state.current_model and st.session_state.current_model.name==delete:
-                    st.session_state.current_model=None
-                st.rerun()
-            if c2.button("Clear all models",use_container_width=True):
-                st.session_state.models=[];st.session_state.current_model=None;st.rerun()
+            with st.form("student_quiz_form"):
+                responses = []
+
+                for i, q in enumerate(questions, start=1):
+                    st.markdown(f"### Pregunta {i}")
+                    st.write(q["pregunta"])
+
+                    response = st.radio(
+                        "Selecciona una respuesta",
+                        q["opciones"],
+                        key=f"{attempt_id}_q_{i}",
+                        index=None,
+                    )
+                    responses.append(response)
+
+                    st.divider()
+
+                accept = st.checkbox(
+                    "Confirmo que quiero enviar este intento al profesor."
+                )
+
+                submitted = st.form_submit_button(
+                    "📨 Enviar prueba",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if submitted:
+
+                if not accept:
+                    st.warning(
+                        "Marca la casilla de confirmación antes de enviar."
+                    )
+
+                elif any(r is None for r in responses):
+                    st.warning(
+                        "Debes responder todas las preguntas antes de enviar."
+                    )
+
+                else:
+                    score = sum(
+                        response == q["correcta"]
+                        for q, response in zip(questions, responses)
+                    )
+
+                    student = {
+                        "name": student_name.strip(),
+                        "dni": student_dni.strip().upper(),
+                        "nie": student_nie.strip().upper(),
+                        "email": student_email.strip(),
+                        "group": student_group.strip(),
+                    }
+
+                    current_exam_id = st.session_state.quiz_exam_id
+                    participant_key = st.session_state.quiz_participant_key
+
+                    csv_bytes = build_submission_csv(
+                        student=student,
+                        exam_id=current_exam_id,
+                        attempt_id=attempt_id,
+                        selected_labels=st.session_state.quiz_selected_labels,
+                        questions=questions,
+                        responses=responses,
+                        score=score,
+                    )
+
+                    try:
+                        save_submission_for_batch(
+                            exam_id=current_exam_id,
+                            participant_key=participant_key,
+                            attempt_id=attempt_id,
+                            student=student,
+                            score=score,
+                            n_questions=len(questions),
+                            csv_bytes=csv_bytes,
+                        )
+                    except Exception as exc:
+                        st.error(
+                            "No se pudo registrar la prueba. "
+                            "No cierres la página y avisa al profesor."
+                        )
+                        st.code(str(exc), language="text")
+                    else:
+                        st.session_state.quiz_submitted = True
+                        st.rerun()
