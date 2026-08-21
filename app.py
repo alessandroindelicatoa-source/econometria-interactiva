@@ -6,6 +6,7 @@ import re
 import smtplib
 import ssl
 import uuid
+import zipfile
 import json
 import tempfile
 import hashlib
@@ -487,6 +488,296 @@ def init_attempt_db():
         conn.commit()
 
 
+
+def init_submission_db():
+    """Tabla separada para resultados ya enviados por los alumnos."""
+    init_attempt_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS submissions (
+                exam_id TEXT NOT NULL,
+                participant_key TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                student_name TEXT NOT NULL,
+                student_dni TEXT NOT NULL,
+                student_nie TEXT NOT NULL,
+                student_email TEXT NOT NULL,
+                group_name TEXT,
+                score INTEGER NOT NULL,
+                n_questions INTEGER NOT NULL,
+                submission_csv BLOB NOT NULL,
+                submitted_at TEXT NOT NULL,
+                PRIMARY KEY (exam_id, participant_key)
+            )
+        """)
+        conn.commit()
+
+
+def save_submission_for_batch(
+    exam_id,
+    participant_key,
+    attempt_id,
+    student,
+    score,
+    n_questions,
+    csv_bytes,
+):
+    """
+    Guarda localmente el examen terminado.
+    NO envía correo al profesor en este momento.
+    """
+    init_submission_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO submissions
+            (
+                exam_id,
+                participant_key,
+                attempt_id,
+                student_name,
+                student_dni,
+                student_nie,
+                student_email,
+                group_name,
+                score,
+                n_questions,
+                submission_csv,
+                submitted_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                exam_id,
+                participant_key,
+                attempt_id,
+                student["name"],
+                student["dni"],
+                student["nie"],
+                student["email"],
+                student.get("group", ""),
+                int(score),
+                int(n_questions),
+                sqlite3.Binary(csv_bytes),
+                datetime.now(MADRID_TZ).isoformat(),
+            ),
+        )
+
+        conn.execute(
+            """
+            UPDATE attempts
+            SET status = 'submitted',
+                submitted_at = ?
+            WHERE exam_id = ? AND participant_key = ?
+            """,
+            (
+                datetime.now(MADRID_TZ).isoformat(),
+                exam_id,
+                participant_key,
+            ),
+        )
+        conn.commit()
+
+
+def get_exam_submissions(exam_id):
+    init_submission_db()
+
+    with sqlite3.connect(ATTEMPT_DB_FILE, timeout=20) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                attempt_id,
+                student_name,
+                student_dni,
+                student_nie,
+                student_email,
+                group_name,
+                score,
+                n_questions,
+                submission_csv,
+                submitted_at
+            FROM submissions
+            WHERE exam_id = ?
+            ORDER BY student_name COLLATE NOCASE, submitted_at
+            """,
+            (exam_id,),
+        ).fetchall()
+
+    submissions = []
+    for row in rows:
+        submissions.append({
+            "attempt_id": row[0],
+            "name": row[1],
+            "dni": row[2],
+            "nie": row[3],
+            "email": row[4],
+            "group": row[5] or "",
+            "score": int(row[6]),
+            "n_questions": int(row[7]),
+            "csv_bytes": bytes(row[8]),
+            "submitted_at": row[9],
+        })
+
+    return submissions
+
+
+def safe_filename(value):
+    cleaned = re.sub(
+        r"[^A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_-]+",
+        "_",
+        str(value),
+    ).strip("_")
+    return cleaned or "estudiante"
+
+
+def build_batch_results_zip(exam_id):
+    """
+    Devuelve un ZIP con:
+    - 00_resumen.csv
+    - un CSV detallado por estudiante
+    """
+    submissions = get_exam_submissions(exam_id)
+
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(
+        buffer,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as zf:
+        summary_io = io.StringIO()
+        writer = csv.writer(summary_io, delimiter=";")
+
+        writer.writerow([
+            "Convocatoria",
+            "Nombre y apellidos",
+            "DNI",
+            "NIE",
+            "Correo UVigo",
+            "Grupo",
+            "Aciertos",
+            "Preguntas",
+            "Nota sobre 10",
+            "Fecha/hora envío",
+            "ID intento",
+        ])
+
+        for sub in submissions:
+            note = (
+                round(
+                    sub["score"] / sub["n_questions"] * 10,
+                    2,
+                )
+                if sub["n_questions"]
+                else 0
+            )
+
+            writer.writerow([
+                exam_id,
+                sub["name"],
+                sub["dni"],
+                sub["nie"],
+                sub["email"],
+                sub["group"],
+                sub["score"],
+                sub["n_questions"],
+                note,
+                sub["submitted_at"],
+                sub["attempt_id"],
+            ])
+
+        zf.writestr(
+            "00_resumen.csv",
+            summary_io.getvalue().encode("utf-8-sig"),
+        )
+
+        for i, sub in enumerate(submissions, start=1):
+            filename = (
+                f"{i:03d}_"
+                f"{safe_filename(sub['name'])}_"
+                f"{sub['attempt_id'][:8]}.csv"
+            )
+            zf.writestr(
+                filename,
+                sub["csv_bytes"],
+            )
+
+    return buffer.getvalue(), submissions
+
+
+def send_batch_results_email(exam_id):
+    """
+    Envía UN solo correo con todos los exámenes de la convocatoria.
+    """
+    zip_bytes, submissions = build_batch_results_zip(exam_id)
+
+    try:
+        email_cfg = st.secrets["email"]
+        sender = email_cfg["sender"]
+        app_password = email_cfg["app_password"]
+    except Exception as exc:
+        raise RuntimeError(
+            "El envío de correo no está configurado correctamente "
+            "en Streamlit Secrets."
+        ) from exc
+
+    msg = EmailMessage()
+    msg["Subject"] = (
+        f"Econometría · Resultados convocatoria "
+        f"{exam_id[:8]} · {len(submissions)} estudiantes"
+    )
+    msg["From"] = sender
+    msg["To"] = TEACHER_EMAIL
+
+    if submissions:
+        mean_score = sum(
+            s["score"] / s["n_questions"] * 10
+            for s in submissions
+            if s["n_questions"]
+        ) / len(submissions)
+
+        body = (
+            "Se ha cerrado una convocatoria del Mini-test de Econometría.\n\n"
+            f"ID convocatoria: {exam_id}\n"
+            f"Exámenes recibidos: {len(submissions)}\n"
+            f"Nota media: {mean_score:.2f}/10\n\n"
+            "El ZIP adjunto contiene:\n"
+            "- 00_resumen.csv con todos los estudiantes y sus resultados.\n"
+            "- un CSV detallado por estudiante con preguntas, respuestas "
+            "y corrección.\n"
+        )
+    else:
+        body = (
+            "Se ha cerrado una convocatoria del Mini-test de Econometría.\n\n"
+            f"ID convocatoria: {exam_id}\n"
+            "No se registraron exámenes enviados en esta convocatoria.\n"
+        )
+
+    msg.set_content(body)
+
+    msg.add_attachment(
+        zip_bytes,
+        maintype="application",
+        subtype="zip",
+        filename=f"resultados_econometria_{exam_id[:8]}.zip",
+    )
+
+    context = ssl.create_default_context()
+
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com",
+        465,
+        context=context,
+        timeout=30,
+    ) as smtp:
+        smtp.login(sender, app_password)
+        smtp.send_message(msg)
+
+    return len(submissions)
+
+
 def normalize_identifier(value):
     return re.sub(r"[^A-Z0-9]", "", str(value).upper())
 
@@ -620,6 +911,8 @@ def default_test_control():
         "selected_fichas": [],
         "selected_topics": [],
         "n_questions": 10,
+        "results_emailed": False,
+        "results_emailed_at": None,
         "updated_at": None,
     }
 
@@ -885,6 +1178,8 @@ def professor_panel():
                         "selected_fichas": selected_fichas_prof,
                         "selected_topics": selected_topics_prof,
                         "n_questions": n_questions_prof,
+                        "results_emailed": False,
+                        "results_emailed_at": None,
                         "updated_at": datetime.now(
                             MADRID_TZ
                         ).isoformat(),
@@ -923,25 +1218,59 @@ def professor_panel():
                         "selected_fichas": selected_fichas_prof,
                         "selected_topics": selected_topics_prof,
                         "n_questions": n_questions_prof,
+                        "results_emailed": False,
+                        "results_emailed_at": None,
                         "updated_at": now.isoformat(),
                     })
                     st.rerun()
 
         with c2:
             if st.button(
-                "🔴 Cerrar ahora",
+                "🔴 Cerrar y enviar resultados",
                 use_container_width=True,
             ):
-                save_test_control({
+                current_exam_id = control.get("exam_id")
+
+                # Primero cerramos la convocatoria para impedir nuevos intentos.
+                closed_control = {
                     "enabled": False,
-                    "exam_id": control.get("exam_id"),
+                    "exam_id": current_exam_id,
                     "start": control.get("start"),
                     "end": control.get("end"),
                     "selected_fichas": control.get("selected_fichas", []),
                     "selected_topics": control.get("selected_topics", []),
                     "n_questions": control.get("n_questions", 10),
+                    "results_emailed": False,
+                    "results_emailed_at": None,
                     "updated_at": now.isoformat(),
-                })
+                }
+                save_test_control(closed_control)
+
+                try:
+                    sent_count = send_batch_results_email(
+                        current_exam_id
+                    )
+                except Exception as exc:
+                    st.error(
+                        "La convocatoria se ha cerrado, pero no se pudo "
+                        "enviar el correo conjunto."
+                    )
+                    st.code(str(exc), language="text")
+                    st.warning(
+                        "Los resultados siguen guardados. "
+                        "Puedes reintentar el envío desde este panel."
+                    )
+                else:
+                    closed_control["results_emailed"] = True
+                    closed_control["results_emailed_at"] = (
+                        datetime.now(MADRID_TZ).isoformat()
+                    )
+                    save_test_control(closed_control)
+                    st.success(
+                        f"Convocatoria cerrada. Se ha enviado un único "
+                        f"correo con {sent_count} examen(es)."
+                    )
+
                 st.rerun()
 
         if start and end:
@@ -962,6 +1291,49 @@ def professor_panel():
                 f"Intentos iniciados: {attempts_started} · "
                 f"Enviados: {attempts_submitted}"
             )
+
+            if control.get("results_emailed", False):
+                emailed_at = parse_control_datetime(
+                    control.get("results_emailed_at")
+                )
+                st.success(
+                    "📨 Resultados conjuntos enviados"
+                    + (
+                        f" · {format_madrid_datetime(emailed_at)}"
+                        if emailed_at
+                        else ""
+                    )
+                )
+            elif not control.get("enabled", False):
+                if st.button(
+                    "📨 Reintentar envío conjunto",
+                    use_container_width=True,
+                    key="retry_batch_email",
+                ):
+                    try:
+                        sent_count = send_batch_results_email(
+                            current_exam_id
+                        )
+                    except Exception as exc:
+                        st.error(
+                            "No se pudo enviar el correo conjunto."
+                        )
+                        st.code(str(exc), language="text")
+                    else:
+                        retry_control = dict(control)
+                        retry_control["results_emailed"] = True
+                        retry_control["results_emailed_at"] = (
+                            datetime.now(MADRID_TZ).isoformat()
+                        )
+                        retry_control["updated_at"] = (
+                            datetime.now(MADRID_TZ).isoformat()
+                        )
+                        save_test_control(retry_control)
+                        st.success(
+                            f"Correo conjunto enviado con "
+                            f"{sent_count} examen(es)."
+                        )
+                        st.rerun()
 
         configured_fichas = control.get("selected_fichas") or []
         configured_topics = control.get("selected_topics") or []
@@ -987,9 +1359,10 @@ def professor_panel():
             )
 
         st.warning(
-            "La programación se conserva mientras la instancia "
-            "de Streamlit permanezca activa. Si la app se reinicia "
-            "completamente, vuelve a programar el examen."
+            "La programación y los resultados se conservan mientras la instancia "
+            "de Streamlit permanezca activa. Si el cierre se produce por la hora "
+            "programada, entra después en este panel y pulsa el envío conjunto. "
+            "Si la app se reinicia completamente, vuelve a programar el examen."
         )
 
 
@@ -2226,10 +2599,12 @@ elif section == "✅ Mini-test":
 
         if st.session_state.get("quiz_submitted", False):
             st.success(
-                "✅ Prueba enviada correctamente al profesor."
+                "✅ Prueba registrada correctamente."
             )
             st.write(
                 "Has utilizado el único intento permitido para esta convocatoria. "
+                "Tu prueba queda guardada y se enviará al profesor junto con las "
+                "del resto de estudiantes cuando se cierre la sesión. "
                 "No se muestra la puntuación ni las respuestas correctas. "
                 "La navegación de la aplicación vuelve a estar disponible."
             )
@@ -2302,25 +2677,21 @@ elif section == "✅ Mini-test":
                     )
 
                     try:
-                        send_submission_email(
-                            csv_bytes=csv_bytes,
-                            student=student,
+                        save_submission_for_batch(
                             exam_id=current_exam_id,
+                            participant_key=participant_key,
                             attempt_id=attempt_id,
+                            student=student,
                             score=score,
                             n_questions=len(questions),
+                            csv_bytes=csv_bytes,
                         )
-
-                    except Exception:
+                    except Exception as exc:
                         st.error(
-                            "No se pudo enviar la prueba. "
+                            "No se pudo registrar la prueba. "
                             "No cierres la página y avisa al profesor."
                         )
-
+                        st.code(str(exc), language="text")
                     else:
-                        mark_attempt_submitted(
-                            current_exam_id,
-                            participant_key,
-                        )
                         st.session_state.quiz_submitted = True
                         st.rerun()
